@@ -1,0 +1,43 @@
+name: Feature request
+description: An OOXML feature that's missing, or an API/CLI improvement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We're explicit about scope — see the "Status & non-goals" section
+        of the README. If your ask is in the ❌ row of the feature table,
+        chances are it's a real engineering project; describe the use
+        case so we can prioritize.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to accomplish?
+      description: |
+        The concrete document or workflow this would unlock — not
+        "support more of OOXML" but "I need pull-quote sidebars from
+        marketing reports to render correctly".
+    validations:
+      required: true
+
+  - type: textarea
+    id: docx-element
+    attributes:
+      label: Specific OOXML element(s) involved
+      description: |
+        e.g. `w:framePr` text-wrap exclusion, `m:nary` integral, embedded
+        `w:embedRegular` fonts. Naming the spec element makes the scope
+        clear.
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Current workaround
+      description: |
+        What are you doing today instead? (LibreOffice fallback,
+        pre-processing the docx, etc.)
+    validations:
+      required: false

@@ -1,0 +1,14 @@
+# Normalize line endings to LF inside the repo so cross-platform diffs
+# stay clean. Go source MUST be LF (gofmt enforces it).
+*           text=auto eol=lf
+
+# Binary fixtures: don't mangle.
+*.png       binary
+*.docx      binary
+*.ttf       binary
+*.ttc       binary
+*.pdf       binary
+
+# go.sum is plain text but Git's diff is noisy; mark as binary-ish so
+# rebases / merges treat it as "regenerate, don't merge".
+go.sum      -diff

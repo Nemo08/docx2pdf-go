@@ -8,17 +8,27 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: [stable]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: ${{ matrix.go }}
           cache: true
 
-      - name: Install poppler (pdftotext, pdfinfo, pdftoppm)
+      - name: Install poppler (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      - name: Install poppler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install poppler
 
       - name: gofmt
         run: |
@@ -35,16 +45,33 @@ jobs:
       - name: go build
         run: go build ./...
 
-      - name: go test
+      - name: go test (race)
         run: go test ./... -race -count=1
 
-      - name: go test -coverprofile (informational)
-        run: go test ./... -coverpkg=./... -coverprofile=cover.out
+      - name: staticcheck
+        # Non-blocking on macOS where some checks rely on the host
+        # toolchain version aligning with module declarations.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          $(go env GOPATH)/bin/staticcheck ./... || echo "::warning::staticcheck reported issues"
         continue-on-error: true
 
       - name: coverage summary
-        if: always()
+        if: runner.os == 'Linux'
         run: |
-          if [ -f cover.out ]; then
-            go tool cover -func=cover.out | tail -1
-          fi
+          go test ./... -coverpkg=./... -coverprofile=cover.out
+          go tool cover -func=cover.out | tail -1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t docx2pdf-go:ci .
+      - name: Smoke-test conversion in container
+        run: |
+          # Use the upstream docx4j sample we already bundle so we don't
+          # need any fixtures the runner can't see.
+          docker run --rm -v $PWD/testdata:/work docx2pdf-go:ci \
+              -in /work/sample_zh.docx -out /work/out.pdf
+          test -s testdata/out.pdf

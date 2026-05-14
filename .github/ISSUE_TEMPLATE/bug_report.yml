@@ -1,0 +1,75 @@
+name: Bug report
+description: A docx that doesn't convert correctly, a panic, or a regression
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! A minimal-reproducer docx attached as a zip
+        is by far the most useful thing — the test harness can absorb it
+        directly. If the input is confidential, paste the relevant
+        `<w:p>` / `<w:tbl>` XML fragment instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `docx2pdf -version` or the module version you pulled
+      placeholder: v0.1.0 or commit hash
+    validations:
+      required: true
+
+  - type: dropdown
+    id: usage
+    attributes:
+      label: How are you using docx2pdf-go?
+      options:
+        - As a Go library
+        - As the CLI binary
+        - As the Docker image
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: |
+        What did you call, and what did the output look like? Screenshots
+        of the rendered PDF are welcome.
+      placeholder: |
+        I called `docx2pdf -in report.docx -out report.pdf` and the
+        page-2 footer overlaps the body…
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: |
+        Footer should sit in the bottom margin, body should stop before it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        Either: (a) attach the docx as a zip, (b) paste the smallest
+        `<w:document>` body XML that triggers the issue, or (c) drop the
+        unzipped `word/document.xml`.
+      placeholder: |
+        Attach a docx, or paste a body XML snippet that hits the bug
+        when used with newDocx().Body(...).
+    validations:
+      required: false
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: e.g. linux/amd64, alpine 3.20, macOS 14.4
+    validations:
+      required: false

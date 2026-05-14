@@ -1,5 +1,10 @@
 # docx2pdf-go
 
+[![test](https://github.com/bobyeoh/docx2pdf-go/actions/workflows/test.yml/badge.svg)](https://github.com/bobyeoh/docx2pdf-go/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/bobyeoh/docx2pdf-go.svg)](https://pkg.go.dev/github.com/bobyeoh/docx2pdf-go)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bobyeoh/docx2pdf-go)](https://goreportcard.com/report/github.com/bobyeoh/docx2pdf-go)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > Pure-Go library and CLI that converts Microsoft Word `.docx` files to PDF.
 > **No JVM. No LibreOffice. No MS Word. No CGO.** Just a single static binary
 > and a `go get`-able package.
