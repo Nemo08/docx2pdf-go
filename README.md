@@ -147,7 +147,7 @@ The image already includes Noto Sans + Noto CJK at the paths above
 | Text wrap around floating images | ❌ — anchor falls back to inline |
 | SmartArt / shapes / charts / equations | ❌ |
 | Form controls, comments, revision tracking | ❌ |
-| RTL scripts (Hebrew / Arabic) | ⚠️ — text preserved, layout LTR |
+| RTL scripts (Hebrew / Arabic) — word order reversed, right-aligned; no full UAX#9 bidi for mixed-direction lines | ⚠️ |
 
 If your document is in the "❌" or "⚠️" rows and you need it to render
 properly, **don't use this library** — fall back to a LibreOffice-backed

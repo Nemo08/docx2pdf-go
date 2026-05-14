@@ -205,6 +205,14 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			}
 			_ = r.applyFontFamily(run.Props, bufFamily)
 			text := buf.String()
+			// In an RTL paragraph, an all-RTL word atom is laid out by
+			// reversing its rune sequence here so the glyph stream we
+			// hand to gopdf draws in visual (right-to-left) order. Mixed
+			// or all-LTR words pass through unchanged — proper UAX#9
+			// resolution for embedded LTR runs is out of scope.
+			if r.paragraphRTL && allRTL(text) {
+				text = reverseRunes(text)
+			}
 			w, _ := r.pdf.MeasureTextWidth(text)
 			out = append(out, atom{
 				kind:       atomWord,
@@ -297,6 +305,14 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			// next non-empty line wraps at the normal margin.
 			hang = 0
 			return nil
+		}
+		// RTL paragraphs draw their atoms in reverse visual order: the
+		// logically-first atom appears at the right edge. Width totals and
+		// per-atom metadata are unchanged — only the iteration order flips.
+		if r.paragraphRTL {
+			for i, j := 0, len(line)-1; i < j; i, j = i+1, j-1 {
+				line[i], line[j] = line[j], line[i]
+			}
 		}
 		if lineMaxH == 0 {
 			lineMaxH = r.opts.DefaultFontSize * 1.2
@@ -545,4 +561,29 @@ func fontAscent(p docx.RunProps, defaultSize float64) float64 {
 		sz = defaultSize
 	}
 	return sz * 0.8
+}
+
+// allRTL reports whether every rune in s belongs to a right-to-left
+// script. Empty string returns false. Used by runsToAtoms to decide
+// whether an atom's text should be rune-reversed for RTL display.
+func allRTL(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !isRTL(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// reverseRunes returns s with its runes in reverse order. Operates on
+// runes (not bytes) so multi-byte characters survive intact.
+func reverseRunes(s string) string {
+	rs := []rune(s)
+	for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
+		rs[i], rs[j] = rs[j], rs[i]
+	}
+	return string(rs)
 }

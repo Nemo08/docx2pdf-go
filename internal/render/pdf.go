@@ -338,6 +338,11 @@ type renderer struct {
 	// active paragraph by that many points (Word's w:ind w:hanging). Cleared
 	// after the first flush so subsequent lines wrap at the normal margin.
 	firstLineHangPt float64
+	// paragraphRTL is set while drawing a right-to-left paragraph.
+	// layoutLine consults it to reverse line-internal atom order before
+	// drawing; runsToAtoms uses it to reverse the rune sequence inside
+	// RTL word atoms. Cleared at paragraph end.
+	paragraphRTL bool
 	// activeTabs is the active paragraph's tab stops, used by layoutLine
 	// to snap atomTab atoms to the next stop.
 	activeTabs []docx.TabStop

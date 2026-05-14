@@ -22,6 +22,19 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		r.pdf.AddPage()
 		r.cursorY = r.marT
 	}
+	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
+	// line-internal atom reversal at flush time. Set before runsToAtoms so
+	// atom construction sees it.
+	r.paragraphRTL = p.Bidi
+	defer func() { r.paragraphRTL = false }()
+	// RTL paragraphs whose alignment was not explicit default to right.
+	// The parser's AlignLeft is the zero value and indistinguishable from
+	// "not set", so we err on the side of doing the natural thing for
+	// bidi=on paragraphs; explicit center/right/justify pass through.
+	align := p.Alignment
+	if p.Bidi && align == docx.AlignLeft {
+		align = docx.AlignRight
+	}
 	// Contextual spacing: suppress before-spacing if the previous paragraph
 	// shared the same style (typical for list items, body-text).
 	sb := p.SpacingBefore
@@ -93,7 +106,7 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	}
 	atoms = append(atoms, r.runsToAtoms(runs)...)
 
-	if err := r.layoutLine(atoms, p.Alignment); err != nil {
+	if err := r.layoutLine(atoms, align); err != nil {
 		r.restoreParagraphState(savedColIdx, savedMarL, savedContentW, savedLine)
 		r.pendingMarker = nil
 		r.firstLineHangPt = 0

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added (later round)
+- **Right-to-left paragraphs render in correct visual order.** A `w:bidi`
+  paragraph now reverses the line-internal atom order at flush time and
+  reverses the rune sequence inside each RTL-only word atom; default
+  alignment flips to right. Hebrew, Arabic, Syriac, Thaana, N'Ko,
+  Samaritan, Mandaic, and the Hebrew/Arabic presentation-forms blocks
+  are detected. Mixed-direction lines (e.g. an Arabic sentence with an
+  embedded English name) are NOT handled — that needs a full UAX#9
+  resolver. Regression case #121.
 - **`w:fldSimple` (compact field encoding) is now recognized.** Word uses
   this form a lot in headers/footers — `<w:fldSimple w:instr="PAGE">…</w:fldSimple>`.
   Previously dropped, which made e.g. PAGE/NUMPAGES in headers render as

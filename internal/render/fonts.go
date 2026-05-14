@@ -214,6 +214,40 @@ func (r *renderer) applyRunFont(p docx.RunProps) error {
 	return r.applyFontFamily(p, r.selectFont(p))
 }
 
+// isRTL reports whether a rune belongs to a right-to-left script
+// (Hebrew, Arabic, Syriac, Thaana, N'Ko, Samaritan, Mandaic, plus the
+// Arabic Presentation Forms used by some legacy encoders). Digits and
+// punctuation are deliberately excluded — they keep their LTR direction
+// even inside RTL paragraphs in this MVP.
+func isRTL(r rune) bool {
+	switch {
+	case r >= 0x0590 && r <= 0x05FF: // Hebrew
+		return true
+	case r >= 0x0600 && r <= 0x06FF: // Arabic
+		// Arabic block contains digits at 0x0660-0x0669 and 0x06F0-0x06F9
+		// — treat those as neutral so they keep LTR direction.
+		if (r >= 0x0660 && r <= 0x0669) || (r >= 0x06F0 && r <= 0x06F9) {
+			return false
+		}
+		return true
+	case r >= 0x0700 && r <= 0x074F: // Syriac
+		return true
+	case r >= 0x0780 && r <= 0x07BF: // Thaana
+		return true
+	case r >= 0x07C0 && r <= 0x07FF: // N'Ko
+		return true
+	case r >= 0x0800 && r <= 0x083F: // Samaritan
+		return true
+	case r >= 0x0840 && r <= 0x085F: // Mandaic
+		return true
+	case r >= 0xFB1D && r <= 0xFDFF: // Hebrew/Arabic Presentation Forms-A
+		return true
+	case r >= 0xFE70 && r <= 0xFEFF: // Arabic Presentation Forms-B
+		return true
+	}
+	return false
+}
+
 // isCJK returns true for runes in the main CJK blocks plus common CJK
 // punctuation/full-width forms. Used both as a break opportunity and to
 // route to the fallback font.
