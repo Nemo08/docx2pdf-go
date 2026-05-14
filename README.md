@@ -43,19 +43,20 @@ external runtimes.
 
 ### What you get
 
-- **Deploys as a ~3.5 MB static binary.** `CGO_ENABLED=0`, single file,
-  runs anywhere Go runs — including `scratch` / `distroless` / Alpine
-  with no fonts installed. A small Latin font (Go fonts, MIT-licensed,
-  ~150 KB) is embedded in the binary as a final fallback.
-- **Ships as a ~70 MB Docker image** with Noto Sans + WenQuanYi Zen Hei
-  fonts baked in (Latin + CJK fallback, no Word installation needed).
-- **`go get`-able library**, with a stable public surface and a streaming
-  `io.Reader` → `io.Writer` API (perfect for HTTP handlers).
-- **CLI** for batch processing — point it at a directory, get a mirrored
-  tree of PDFs out.
-- **CJK first-class**: font fallback for CJK glyphs, per-character break
-  opportunities so Chinese/Japanese/Korean paragraphs wrap correctly even
-  without whitespace.
+- **~3.5 MB static binary.** Runs in `scratch` / `distroless` / Alpine
+  with no fonts installed — a 150 KB Latin face (Go fonts, MIT) is
+  embedded as a last-resort fallback so the binary always has
+  something to draw with.
+- **~70 MB official Docker image** with Noto Sans + WenQuanYi Zen Hei
+  baked in for Latin + CJK fallback, no Word installation needed.
+- **Streaming `io.Reader` → `io.Writer` API** for HTTP handlers and
+  in-memory pipelines.
+- **CLI for batch processing** — point it at a directory tree, get a
+  mirrored tree of PDFs.
+- **CJK supported via fallback font** with per-character line-break
+  opportunities, so Chinese/Japanese/Korean paragraphs wrap mid-text
+  even without whitespace. Latin and CJK glyph shaping work; Arabic
+  letter shaping (initial/medial/final) is not yet implemented.
 
 ---
 
@@ -67,6 +68,19 @@ external runtimes.
 go get github.com/bobyeoh/docx2pdf-go
 ```
 
+**1. File paths — the simplest case.** Empty Options auto-detects a
+system font; pass `FontRegular` for reproducible output.
+
+```go
+import docx2pdf "github.com/bobyeoh/docx2pdf-go"
+
+func writeReport() error {
+    return docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{})
+}
+```
+
+**2. Streaming — perfect for HTTP handlers.**
+
 ```go
 import (
     "bytes"
@@ -76,46 +90,43 @@ import (
     docx2pdf "github.com/bobyeoh/docx2pdf-go"
 )
 
-// 1) File paths — the simplest case. Empty Options auto-detects a
-//    system font; pass FontRegular for reproducible output.
-err := docx2pdf.Convert("in.docx", "out.pdf", docx2pdf.Options{})
-
-// 2) Streaming — perfect for HTTP handlers.
 func handle(w http.ResponseWriter, r *http.Request) {
     body, _ := io.ReadAll(r.Body)
     w.Header().Set("Content-Type", "application/pdf")
     _ = docx2pdf.ConvertReader(
-        bytes.NewReader(body), int64(len(body)),
-        w,
-        docx2pdf.Options{FontRegular: fontPath},
+        bytes.NewReader(body), int64(len(body)), w,
+        docx2pdf.Options{},
     )
 }
+```
 
-// 3) Parse → inspect / modify → render.
-doc, _ := docx2pdf.Open("in.docx")
+**3. Parse → inspect / modify → render.**
+
+```go
+doc, err := docx2pdf.Open("in.docx")
+if err != nil {
+    return err
+}
 for _, b := range doc.Body {
     if p, ok := b.(docx2pdf.Paragraph); ok && len(p.Runs) > 0 {
-        // walk the AST, redact, translate, reformat, ...
+        // walk the AST: redact, translate, reformat, ...
     }
 }
-_ = docx2pdf.Render(doc, "out.pdf", docx2pdf.Options{FontRegular: fontPath})
+return docx2pdf.Render(doc, "out.pdf", docx2pdf.Options{})
 ```
 
 ### As a CLI
 
 ```bash
-# Simplest form — system font is auto-detected (Arial on macOS,
-# DejaVu / Liberation / Noto on Linux).
+# Simplest — system font auto-detected.
 docx2pdf -in input.docx -out output.pdf
 
-# Explicit font (recommended for reproducibility):
-docx2pdf -in input.docx -out output.pdf -font Regular.ttf
-
-# Batch — walks a directory tree, mirrors structure to -out
-docx2pdf -in indir/ -out outdir/ -font Regular.ttf \
-         -font-fallback NotoSansCJK.ttc \
-         -recursive -keep-going -page-numbers -v
+# Batch — walks a directory tree, mirrors structure to -out.
+docx2pdf -in indir/ -out outdir/ -recursive -keep-going -page-numbers
 ```
+
+Run `docx2pdf -help` for the full flag list (font overrides, parallel
+workers, lenient mode, author override, etc.).
 
 ### Docker
 
@@ -173,50 +184,98 @@ docker run --rm -v "$PWD":/work \
 
 ## What it actually renders
 
+> **TL;DR**: solid for reports / contracts / generated paperwork in
+> Latin + CJK. Loses fidelity on floating-image wrap, math typesetting,
+> and SmartArt. See the ⚠️ / ❌ rows for the precise list.
+
+### Text & inline formatting
+
 | Feature | Status |
 |---|---|
-| Paragraphs: alignment, indent (left + first-line + hanging), line spacing | ✅ |
-| Runs: bold / italic / underline / strikethrough / color / font size | ✅ |
-| Lists: decimal / bullet / lower-upper letter / lower-upper roman, multi-level, custom `start` | ✅ |
-| Tables: column widths, `gridSpan` column merging, `vMerge` row merging | ✅ |
-| Multi-page tables (crosses page boundaries cleanly) | ✅ |
-| Inline images: PNG / JPEG / GIF | ✅ |
-| Anchored images (`wp:anchor`) — rendered as inline best-effort | ✅ |
-| Legacy VML images (`w:pict` / `v:imagedata`) — older Word docs, pasted content | ✅ |
-| Text boxes (`wps:txbx` / `w:txbxContent`) — content extracted as inline italic; box geometry not preserved | ⚠️ |
-| Paragraph styles with `basedOn` chains + `docDefaults` (rPr + pPr) | ✅ |
-| Multi-section documents — different page sizes / orientations per section | ✅ |
-| Headers and footers — per-section, with full block content | ✅ |
-| Fields: `PAGE` / `NUMPAGES` (substituted per page); other fields fall through to their cached value so they still look right | ✅ |
-| Clickable external hyperlinks (real PDF annotations) | ✅ |
-| CJK font fallback + per-character line breaking for whitespace-less scripts | ✅ |
-| Explicit page breaks (`w:br w:type="page"` and `w:pageBreakBefore`) | ✅ |
-| Custom page size and margins from `w:sectPr` | ✅ |
+| Bold / italic / underline / strikethrough / color / size / sub-super-script | ✅ |
+| Caps / small-caps / vertical position (`w:position`) / character scale (`w:w`) | ✅ |
+| Letter spacing (`w:spacing` in rPr) | ✅ |
+| Highlight + shading background fills | ✅ |
 | Hidden text (`w:vanish`) — suppressed from output | ✅ |
-| Nested tables (table inside a cell) | ✅ |
-| Cell shading (`w:shd`) + per-edge borders (single/double/dashed/dotted) | ✅ |
-| Footnotes & endnotes: refs as `[N]` superscript, bodies at page bottom; endnotes as document trailer | ✅ |
-| Comments (`w:commentReference` / comments.xml) — surfaced as a trailing "Comments" section | ✅ |
-| PDF outline / clickable sidebar bookmarks from `Heading1..Heading9` + `Title` styles | ✅ |
-| Content controls (`w:sdt`) — block and inline; transparent wrapper, text preserved | ✅ |
-| Math equations (`m:oMath` / `m:oMathPara`) — text extracted as italic, structure lost | ⚠️ |
-| Charts (`c:chart`) — title, axis labels, series names extracted as `[Chart: …]` text; data graphic not drawn | ⚠️ |
+| Theme colors / theme fonts (Heading / Body roles) | ✅ |
+| Hyperlinks (external URL + internal anchors) — real PDF annotations | ✅ |
+| Soft-hyphen / non-breaking hyphen / `w:sym` symbol references | ✅ |
+
+### Paragraph & page layout
+
+| Feature | Status |
+|---|---|
+| Alignment: left / center / right / justify | ✅ |
+| Indent: left / first-line / hanging | ✅ |
+| Line spacing (single / 1.5x / double / exact / atLeast) | ✅ |
+| Tab stops + tab leaders (dot / hyphen / underscore) | ✅ |
+| Drop caps (`w:framePr w:dropCap`) | ✅ |
 | Multi-column layout (`w:cols`) | ✅ |
-| Tracked changes (`w:ins` / `w:del` / `w:moveFrom` / `w:moveTo`) — accept-all mode | ✅ |
-| Markup compatibility wrapper (`mc:AlternateContent`) — Choice over Fallback | ✅ |
-| Embedded text boxes (`wps:txbx`) — content extracted as inline italic; box geometry not preserved | ⚠️ |
-| Floating frames (`w:framePr` placement) — anchored at the right page position; body text does NOT wrap around | ⚠️ |
-| RTL scripts (Hebrew / Arabic) — word order reversed, right-aligned; no full UAX#9 bidi for mixed-direction lines | ⚠️ |
-| Text wrap around floating images (`wp:anchor` with wrap geometry) | ❌ — anchor falls back to inline |
+| Multi-section docs (per-section page size / orientation / margins) | ✅ |
+| Headers & footers (default / first / even) | ✅ |
+| Mirror margins, gutter, page borders, line numbers | ✅ |
+| Page background color (`w:background` gated by `displayBackgroundShape`) | ✅ |
+| Explicit page breaks (`w:br type="page"` / `w:pageBreakBefore`) | ✅ |
+
+### Lists & tables
+
+| Feature | Status |
+|---|---|
+| Numbered lists: decimal / lower-upper letter / lower-upper roman | ✅ |
+| Bullet lists with custom text or picture bullets | ✅ |
+| Multi-level lists + legal numbering (`w:isLgl`) + custom `start` | ✅ |
+| Tables: column widths, `gridSpan` merge, `vMerge` merge | ✅ |
+| Multi-page tables with header-row repeat | ✅ |
+| Nested tables (table inside a cell) | ✅ |
+| Cell shading + per-edge borders (single / double / dashed / dotted) | ✅ |
+| Row `cantSplit` (keep row intact across page break) | ✅ |
+| Table styles (`w:tblStyle` + `w:tblLook` conditional emphasis) | ✅ |
+
+### Images & graphics
+
+| Feature | Status |
+|---|---|
+| Inline images: PNG / JPEG / GIF | ✅ |
+| Image cropping (`a:srcRect`) and explicit extent | ✅ |
+| Legacy VML images (`w:pict` / `v:imagedata`) — older Word, Excel/Outlook pastes | ✅ |
+| Anchored images (`wp:anchor`) — rendered as inline best-effort | ⚠️ |
+| Text wrap around floating images | ❌ |
 | SmartArt diagrams | ❌ |
-| Form controls' interactive behavior (`w:sdt` is transparent, but inputs aren't interactive in the PDF) | ❌ |
-| Arabic letter shaping (initial/medial/final connected forms) | ❌ |
-| Embedded fonts (`w:embedRegular`) | ❌ |
+| Charts (`c:chart`) — title / labels extracted as `[Chart: …]` text | ⚠️ |
+
+### Document structure & metadata
+
+| Feature | Status |
+|---|---|
+| Paragraph styles with `basedOn` chains + `docDefaults` | ✅ |
+| PDF outline / sidebar bookmarks from `Heading1..9` + `Title` styles | ✅ |
+| Fields: `PAGE` / `NUMPAGES` / `DATE` / `AUTHOR` / `SEQ` / `REF` / `HYPERLINK` | ✅ |
+| Both field encodings: `fldChar` complex + `fldSimple` compact | ✅ |
+| Footnotes & endnotes (refs as `[N]`, bodies at page bottom / trailer) | ✅ |
+| Comments (`comments.xml`) — surfaced as a trailing "Comments" section | ✅ |
+| Tracked changes (`w:ins` / `w:del` / `w:moveFrom` / `w:moveTo`) — accept-all | ✅ |
+| Content controls (`w:sdt`) — block + inline, transparent wrapper | ✅ |
+| `mc:AlternateContent` — Choice over Fallback | ✅ |
+| Doc properties (`docProps/core.xml` + `app.xml`) → PDF /Info | ✅ |
+| Settings (`settings.xml`) — defaultTabStop / evenAndOddHeaders / displayBackgroundShape | ✅ |
+
+### Advanced / partial
+
+| Feature | Status |
+|---|---|
+| Math equations (`m:oMath` / `m:oMathPara`) — text extracted as italic, structure lost | ⚠️ |
+| Text boxes (`wps:txbx`) — inline-extracted as italic; box geometry not preserved | ⚠️ |
+| Floating frames (`w:framePr`) — anchored correctly; body text does **not** wrap around | ⚠️ |
+| RTL (Hebrew / Arabic) — word order reversed, right-aligned; no UAX#9 mixed-direction | ⚠️ |
+| OLE / embedded objects — emit `[Embedded object]` placeholder | ⚠️ |
+| Arabic letter shaping (initial / medial / final) | ❌ |
+| Form controls' interactive behavior | ❌ |
+| Embedded fonts (`w:embedRegular`) loaded from package | ❌ |
 
 If your document hinges on the "❌" rows and you need pixel-perfect
 rendering, **fall back to a LibreOffice-backed service**. The "⚠️" rows
-preserve content but lose some structural fidelity; check whether that's
-acceptable for your use case.
+preserve content but lose some structural fidelity — check whether
+that's acceptable for your use case.
 
 ---
 
@@ -321,17 +380,18 @@ overlapping their text when numbering.xml omitted indent.
 
 ## Performance
 
-Apple M5, `go test -bench=.`:
+Apple M-series (arm64), `go test -bench=. -benchtime=2s`:
 
 | Benchmark | Time per op |
 |---|---|
-| Parse 2-paragraph docx | **21 µs** |
-| Parse 500-paragraph docx | **468 µs** |
-| Convert 2-paragraph → PDF | **14 ms** (font load dominates) |
-| Convert 500-paragraph → PDF | **18.5 ms** |
+| Parse 2-paragraph docx | **22 µs** |
+| Parse 500-paragraph docx | **534 µs** |
+| Convert 2-paragraph → PDF | **13 ms** (font load dominates) |
+| Convert 500-paragraph → PDF | **21 ms** |
 
-The 500-paragraph render is only ~4 ms slower than the small one — the line
-breaker and table layout scale linearly with cheap constants.
+The 500-paragraph render is ~8 ms slower than the small one — the line
+breaker and table layout scale linearly with cheap constants, leaving
+the per-doc font load as the bulk of small-doc cost.
 
 ---
 
@@ -345,6 +405,49 @@ If you need complex DTP, real shape layout, SmartArt diagrams, full bidi
 shaping, or embedded-font support — use LibreOffice as a backend. This
 library exists for everyone who would rather not ship a 500 MB office
 suite next to their Go service.
+
+---
+
+## FAQ
+
+**Does it support `.doc` (Word 97-2003 binary format)?**
+No. `.docx` only. Convert legacy `.doc` to `.docx` first (LibreOffice's
+`soffice --convert-to docx` does this reliably).
+
+**Does it support `.pptx` / `.xlsx`?**
+No. Word documents only. PowerPoint and Excel are separate OOXML
+schemas with their own renderers (and very different layout models —
+in particular slides are absolute-positioned, which is the opposite of
+flow text).
+
+**Encrypted / password-protected docx?**
+No. The zip is opened with `archive/zip` which doesn't know about the
+ECMA-376 Agile Encryption layer. Decrypt first with a dedicated tool.
+
+**Will the output look identical to Word?**
+Close, not pixel-identical. Fonts, hyphenation, and floating-image
+wrap differ. For Latin / CJK content-driven docs the difference is
+usually below "reader notices anything off". For complex layouts
+(magazine-style multi-column with image wrap), it won't.
+
+**Why doesn't Noto Sans CJK work as the fallback font?**
+gopdf only renders TrueType outlines. Noto Sans CJK uses
+CFF/PostScript outlines (the `.ttc` contains `OTTO`-tagged faces);
+gopdf rejects them. Use a TrueType CJK font like WenQuanYi Zen Hei
+(bundled in our Docker image) or Source Han Sans's TTF distribution.
+A clear error mentions this if you try.
+
+**Can the AST be modified before rendering?**
+Yes — `Open` returns a `*Document` whose `Body` / `Sections` / `Styles`
+fields are exported. The example in Quick start §3 walks the AST.
+This is useful for redaction, translation, or template fill-in
+pipelines.
+
+**Is the public API stable?**
+Pre-1.0, so the surface may shift between minor releases. The
+function signatures of `Convert` / `ConvertReader` / `Open` / `Render`
+are unlikely to change; the AST struct fields (Paragraph, Run, Table)
+may gain fields as features land. Pin a tag in production.
 
 ---
 
