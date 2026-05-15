@@ -58,6 +58,13 @@ type Document struct {
 	Properties Properties
 	// Settings from word/settings.xml — doc-wide rendering knobs.
 	Settings Settings
+	// FootnoteSeparators captures any custom w:type="separator" /
+	// "continuationSeparator" / "continuationNotice" footnote bodies.
+	// Keys are the OOXML w:type values; absence means "use renderer
+	// default" (a thin horizontal rule).
+	FootnoteSeparators map[string][]Block
+	// EndnoteSeparators is the endnote equivalent.
+	EndnoteSeparators map[string][]Block
 }
 
 // Theme holds the bits of theme1.xml we read.
@@ -141,6 +148,11 @@ type ParaDefaults struct {
 type PageNumberType struct {
 	Start int    // 0 = use natural (1, 2, 3 ...)
 	Fmt   string // "decimal" (default), "upperRoman", "lowerRoman", "upperLetter", "lowerLetter"
+	// ChapStyle is the heading style level (1..9) prefixed before the
+	// page number when w:chapStyle is set; ChapSep is the separator
+	// character ("hyphen", "period", "colon", "emDash", "enDash").
+	ChapStyle int
+	ChapSep   string
 }
 
 // PageBorders encodes w:pgBorders — colored frame around the page.
@@ -208,6 +220,38 @@ type Section struct {
 	LineNumbering     LineNumbering // w:lnNumType
 	Columns           int           // w:cols w:num (1 = no columns)
 	ColumnSpaceTwips  int           // w:cols w:space between columns
+	// VAlign is w:vAlign — vertical page alignment for the section:
+	// "" (default top), "center", "both" (justify), "bottom". Cover pages
+	// often set this to "center" for the title.
+	VAlign string
+	// DocGrid is w:docGrid — the CJK line/character grid. When type is
+	// "lines" or "linesAndChars" the renderer enforces an exact line height
+	// derived from linePitch (1/20 pt), giving the per-page line-count look
+	// that East-Asian docs expect.
+	DocGrid DocGrid
+	// FormProt is w:formProt — section is form-protected.
+	FormProt bool
+	// RtlGutter mirrors the gutter onto the right side for RTL languages.
+	RtlGutter bool
+	// FootnotePr / EndnotePr override doc-level note configuration for
+	// this section: position, numbering format, restart policy, start at N.
+	FootnotePr *NoteConfig
+	EndnotePr  *NoteConfig
+}
+
+// DocGrid captures w:docGrid's three knobs.
+type DocGrid struct {
+	Type      string // "", "lines", "linesAndChars", "snapToChars", "default"
+	LinePitch int    // 1/20 pt per line
+	CharSpace int    // 1/100 pt added per char (only for linesAndChars)
+}
+
+// NoteConfig captures w:footnotePr / w:endnotePr settings.
+type NoteConfig struct {
+	Pos      string // "pageBottom", "beneathText", "sectEnd", "docEnd"
+	NumFmt   string // "decimal", "upperRoman", ...
+	NumStart int    // start at N
+	Restart  string // "continuous", "eachSect", "eachPage"
 }
 
 // ParagraphStyle is a flattened paragraph-style definition from styles.xml.
@@ -279,6 +323,33 @@ type Paragraph struct {
 	// only the bottom edge set. We reuse CellBorders because the shape
 	// (Top / Bottom / Left / Right BorderEdge) is identical.
 	Borders CellBorders
+	// WidowControl — preserve at least 2 lines of the paragraph on a page
+	// (default true in Word). Parsed but not yet honored at layout time.
+	WidowControl *bool
+	// MirrorIndents flips IndentLeftPt/Right on mirrored (verso) pages.
+	MirrorIndents bool
+	// AdjustRightInd — auto-adjust the right indent for East-Asian wrap.
+	AdjustRightInd bool
+	// SnapToGrid — when false, the paragraph opts out of the section's
+	// docGrid line snapping.
+	SnapToGrid *bool
+	// OutlineLvl is w:outlineLvl (0-9). When >= 0 this paragraph contributes
+	// to the PDF outline even if its style is not Heading*.
+	OutlineLvl int
+	// TextDirection is one of "lrTb" (default), "tbRl", "btLr", "lrTbV",
+	// "tbRlV", "tbLrV". When non-default the renderer rotates the
+	// paragraph's drawing region (vertical CJK text).
+	TextDirection string
+	// TextAlignment is the vertical baseline anchor inside a line:
+	// "top", "center", "baseline", "bottom", "auto" (default "auto").
+	TextAlignment string
+	// CJK line-break / spacing controls.
+	Kinsoku       *bool // w:kinsoku — honor line-break rules for CJK
+	WordWrap      *bool // w:wordWrap — allow word break for Latin
+	OverflowPunct *bool // w:overflowPunct — punctuation may hang outside text area
+	TopLinePunct  *bool // w:topLinePunct — leading punctuation compression
+	AutoSpaceDE   *bool // w:autoSpaceDE — auto-space CJK/Latin
+	AutoSpaceDN   *bool // w:autoSpaceDN — auto-space CJK/numeric
 
 	// endsSection is set when this paragraph's pPr contained an inline sectPr.
 	// Internal-only: the parser uses it to know when to close out a section.
@@ -337,6 +408,15 @@ type Run struct {
 	// Image source-rect crop in PERCENT (a:srcRect attrs are 1/1000 of percent
 	// from each edge). E.g. CropTop=10000 = 10%. Zero = no crop on that side.
 	CropTopPct, CropBottomPct, CropLeftPct, CropRightPct float64
+	// ImageAnchored is true if the run comes from a wp:anchor (floating
+	// image) rather than wp:inline. Renderer still draws inline as a
+	// best-effort fallback; AnchorAlignH/V capture the requested anchor
+	// alignment ("left", "center", "right", "inside", "outside") so the
+	// inline placement can at least approximate the source location.
+	ImageAnchored                    bool
+	AnchorAlignH, AnchorAlignV       string
+	AnchorOffsetXPt, AnchorOffsetYPt float64
+	AnchorWrap                       string // "", "none", "square", "tight", "through", "topAndBottom"
 	// FootnoteID, when non-empty, tags this run as a footnote / endnote
 	// reference site. The visible Text is still drawn (typically as a
 	// superscript marker); the renderer also queues the corresponding note
@@ -410,6 +490,51 @@ type RunProps struct {
 	// emboss/imprint with a faint highlight stroke, outline with text fill
 	// none + a stroke. These are approximations.
 	TextEffect string
+	// Em is the CJK emphasis mark (w:em) — "dot" / "circle" / "underDot" /
+	// "comma" etc. The renderer draws a small mark above each glyph of the
+	// run. Empty = no emphasis mark.
+	Em string
+	// Lang carries explicit language hints (w:lang) for the latin / CJK /
+	// complex-script halves of the run. The renderer uses Lang.EastAsia
+	// to bias the CJK fallback font selection even when the character itself
+	// is ambiguous (a full-width digit is "0030 ZERO" — its language tells
+	// us whether to draw it with the latin or the CJK face).
+	Lang RunLang
+	// RTL = w:rtl: the run reads right-to-left (Hebrew/Arabic). When
+	// combined with Bidi on the paragraph the renderer reverses glyph
+	// order for the run.
+	RTL bool
+	// CS = w:cs: this run is a complex-script run (Arabic/Hebrew/Thai). The
+	// complex-script bold/italic/size attributes (BCs/ICs/SzCs) override the
+	// regular B/I/Sz when CS is set.
+	CS       bool
+	BCs, ICs bool
+	SzCs     float64
+	// NoProof suppresses spellcheck flags; render-noop, but parsed for
+	// completeness so consumers can introspect it.
+	NoProof bool
+	// WebHidden mirrors Word's "hide in web view" toggle. We treat it like
+	// w:vanish for print output (web-hidden text shouldn't appear in PDF).
+	WebHidden bool
+	// KernThresholdPt is w:kern in half-points → points (font kerning
+	// activates above this size threshold). Stored for completeness; the
+	// underlying gopdf doesn't expose a kerning toggle so render is a no-op.
+	KernThresholdPt float64
+	// FitTextID + FitTextWidthPt are w:fitText — squeeze N runs into a
+	// fixed width. We don't currently implement the squeeze; stored so the
+	// caller can detect it.
+	FitTextID      int
+	FitTextWidthPt float64
+	// TextBorder mirrors w:bdr (a border around the run's text — distinct
+	// from paragraph or table borders). Empty Style means "no border".
+	TextBorder BorderEdge
+}
+
+// RunLang carries the language hints from w:lang.
+type RunLang struct {
+	Latin    string // w:val — e.g. "en-US"
+	EastAsia string // w:eastAsia — e.g. "zh-CN", "ja-JP"
+	Bidi     string // w:bidi — e.g. "ar-SA", "he-IL"
 }
 
 // Alignment maps w:jc values.
@@ -441,6 +566,49 @@ type Table struct {
 	// outer rows/columns taking the outer edge and interior cells taking
 	// insideH/insideV) so the renderer only has to read CellBorders.
 	Borders TableBorders
+	// Layout is "auto" (default — column widths adjust to content) or
+	// "fixed" (column widths are strictly the values in ColumnWidthsTwips
+	// / tcW). The renderer is currently fixed-only; we record this so it
+	// can be honored if/when an auto-fit pass lands.
+	Layout string
+	// TableWidthTwips / TableWidthType captures w:tblW (table total width).
+	// Type is one of "", "auto", "dxa", "pct", "nil". Twips holds the dxa
+	// value when Type=="dxa", or the pct value (0..5000 = 0..100%) when
+	// Type=="pct".
+	TableWidthTwips int
+	TableWidthType  string
+	// FloatPos carries w:tblPr/w:tblpPr — the floating-table anchor. When
+	// non-nil the table is positioned absolutely; the renderer currently
+	// still draws it in-flow (no text wrap), but the anchor is preserved
+	// for callers that introspect the AST.
+	FloatPos *TableFloatPos
+	// Overlap is w:tblOverlap: "" or "never".
+	Overlap string
+	// Caption and Description mirror w:tblCaption / w:tblDescription —
+	// accessibility metadata that surfaces in tagged PDFs.
+	Caption     string
+	Description string
+	// DefaultCellMargins captures w:tblCellMar — default margins applied
+	// to every cell unless that cell sets w:tcMar.
+	DefaultCellMargins CellMargins
+}
+
+// CellMargins in points.
+type CellMargins struct {
+	Top, Bottom, Left, Right float64
+}
+
+// TableFloatPos captures w:tblpPr — anchor coordinates and text-wrap
+// behavior for a floating table. Mirrors the FrameInfo shape used for
+// paragraph frames.
+type TableFloatPos struct {
+	HAnchor                                                                      string // "margin", "page", "text"
+	VAnchor                                                                      string // "margin", "page", "text"
+	XAlign                                                                       string // "left", "center", "right", "inside", "outside"
+	YAlign                                                                       string // "top", "center", "bottom", "inside", "outside"
+	XTwips                                                                       int
+	YTwips                                                                       int
+	LeftFromTextTwips, RightFromTextTwips, TopFromTextTwips, BottomFromTextTwips int
 }
 
 // TableLook is the parsed w:tblLook bitfield.
@@ -472,6 +640,13 @@ type TableRow struct {
 	// CantSplit means the row must be drawn intact — if it won't fit on the
 	// current page, push it to the next page first.
 	CantSplit bool
+	// WBeforeTwips / WAfterTwips are w:wBefore / w:wAfter — extra leading
+	// or trailing column space (a fake first/last column whose width is
+	// these twips). Parsed but not currently rendered.
+	WBeforeTwips, WAfterTwips int
+	// CellSpacingTwips is w:tblCellSpacing — space between cells. Parsed
+	// but not rendered (we render with the standard zero-gap layout).
+	CellSpacingTwips int
 }
 
 type TableCell struct {
@@ -482,10 +657,33 @@ type TableCell struct {
 	GridSpan int
 	// VMerge is "restart", "continue", or "" (no vertical merge).
 	VMerge string
+	// HMerge is "restart" or "continue" — Word's deprecated horizontal
+	// merge predates GridSpan. Parsed for completeness; the renderer
+	// resolves it the same way as GridSpan continuation cells (consumed
+	// by the preceding cell's span).
+	HMerge string
 	// Shading is the 6-hex background fill color (w:shd w:fill).
 	Shading string
 	// VAlign is "top", "center", "bottom", or "" (default top).
 	VAlign string
+	// TextDirection rotates the cell's text. One of "" (default lrTb),
+	// "tbRl" (90° clockwise, top-to-bottom right-to-left — Chinese/Japanese
+	// vertical table headers), "btLr" (270° / 90° counter-clockwise — the
+	// classic English rotated header), "lrTbV", "tbRlV", "tbLrV".
+	TextDirection string
+	// NoWrap suppresses line breaks: cell content stays on a single line
+	// even if it overflows the column. Word uses this for narrow numeric
+	// columns.
+	NoWrap bool
+	// HideMark: hide the paragraph-end mark inside this cell so it doesn't
+	// contribute to row height. Parsed but unused by the renderer.
+	HideMark bool
+	// FitText: scale text horizontally to fit the column width.
+	FitText bool
+	// CellWidthType is "", "auto", "dxa", "pct", "nil"; CellWidthTwips
+	// carries the dxa or pct value (pct stored as twips-equivalent).
+	CellWidthType  string
+	CellWidthTwips int
 	// Borders, when set, override the default thin black per-edge borders.
 	Borders CellBorders
 	// Margins (w:tcMar) in points, defaulting to {Top: 0, Bottom: 0, Left: 4, Right: 4}
@@ -578,6 +776,10 @@ type Numbering struct {
 	// PicBullets maps w:numPicBulletId → image rId. A level whose
 	// w:lvlPicBulletId names one of these renders the image as its marker.
 	PicBullets map[int]string
+	// Overrides keyed by numId → ilvl → NumOverride. Captures
+	// w:lvlOverride inside a w:num: per-numId level swaps and start
+	// overrides. Empty map is fine.
+	Overrides map[int]map[int]NumOverride
 }
 
 type AbstractNum struct {
@@ -598,4 +800,25 @@ type NumLevel struct {
 	// PicBulletID, when > 0, names a w:numPicBullet whose image should be
 	// used as this level's bullet marker. Resolved via Numbering.PicBullets.
 	PicBulletID int
+	// Suff is w:suff — what comes between the marker and the body:
+	// "tab" (default), "space", or "nothing".
+	Suff string
+	// LvlRestart is w:lvlRestart — when set, this level restarts whenever
+	// the level value is reached. 0 means "never restart"; negative means
+	// "use default". Zero default = renderer uses Word's rule.
+	LvlRestart int
+	// PStyleLink is w:pStyle — a paragraph style that's linked to this
+	// level. Paragraphs carrying that style number from this level
+	// automatically.
+	PStyleLink string
+}
+
+// NumOverride captures w:lvlOverride for a concrete num. We attach this to
+// the Numbering map by storing overrides keyed by (numId, ilvl).
+type NumOverride struct {
+	// StartOverride > 0 forces a different starting value for this level
+	// on this specific numId.
+	StartOverride int
+	// LvlReplace optionally swaps in a brand-new level definition.
+	LvlReplace *NumLevel
 }

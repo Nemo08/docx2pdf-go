@@ -509,8 +509,10 @@ func parseSettings(f *zip.File, s *Settings) error {
 
 // parseNotes parses word/footnotes.xml or word/endnotes.xml. Each
 // w:footnote / w:endnote element has w:id and contains paragraphs.
-// Separator/continuation notes (w:type="separator"/"continuationSeparator")
-// are skipped — they contain only the visual separator rule.
+// Separator notes (w:type="separator", "continuationSeparator",
+// "continuationNotice") are captured into Document.FootnoteSeparators /
+// EndnoteSeparators so the renderer can honor any custom separator the
+// document provides; comments don't use separator semantics.
 func parseNotes(f *zip.File, doc *Document, elemName string, out map[string][]Block) error {
 	rc, err := openZipFile(f)
 	if err != nil {
@@ -536,8 +538,23 @@ func parseNotes(f *zip.File, doc *Document, elemName string, out map[string][]Bl
 		}
 		id := attr(se, "id")
 		kind := attr(se, "type")
-		if kind == "separator" || kind == "continuationSeparator" {
-			_ = dec.Skip()
+		if kind == "separator" || kind == "continuationSeparator" || kind == "continuationNotice" {
+			blocks, err := parseNoteBody(dec, se, pctx)
+			if err != nil {
+				return err
+			}
+			switch elemName {
+			case "footnote":
+				if doc.FootnoteSeparators == nil {
+					doc.FootnoteSeparators = map[string][]Block{}
+				}
+				doc.FootnoteSeparators[kind] = blocks
+			case "endnote":
+				if doc.EndnoteSeparators == nil {
+					doc.EndnoteSeparators = map[string][]Block{}
+				}
+				doc.EndnoteSeparators[kind] = blocks
+			}
 			continue
 		}
 		blocks, err := parseNoteBody(dec, se, pctx)
@@ -1310,12 +1327,18 @@ func parseNumbering(f *zip.File, out *Numbering) error {
 				_ = dec.Skip()
 				continue
 			}
-			absID, err := decodeNum(dec, se)
+			absID, overrides, err := decodeNum(dec, se)
 			if err != nil {
 				return err
 			}
 			if absID >= 0 {
 				out.NumToAbs[numID] = absID
+			}
+			if len(overrides) > 0 {
+				if out.Overrides == nil {
+					out.Overrides = map[int]map[int]NumOverride{}
+				}
+				out.Overrides[numID] = overrides
 			}
 		}
 	}
@@ -1388,7 +1411,7 @@ func findRidInSubtree(dec *xml.Decoder, start xml.StartElement) string {
 }
 
 func decodeLevel(dec *xml.Decoder, start xml.StartElement) (NumLevel, error) {
-	lv := NumLevel{Start: 1}
+	lv := NumLevel{Start: 1, LvlRestart: -1}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -1409,6 +1432,19 @@ func decodeLevel(dec *xml.Decoder, start xml.StartElement) (NumLevel, error) {
 				_ = dec.Skip()
 			case "lvlText":
 				lv.Text = attr(t, "val")
+				_ = dec.Skip()
+			case "suff":
+				lv.Suff = attr(t, "val")
+				_ = dec.Skip()
+			case "lvlRestart":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						lv.LvlRestart = x
+					}
+				}
+				_ = dec.Skip()
+			case "pStyle":
+				lv.PStyleLink = attr(t, "val")
 				_ = dec.Skip()
 			case "pPr":
 				if err := decodeLevelPPr(dec, t, &lv); err != nil {
@@ -1464,27 +1500,82 @@ func decodeLevelPPr(dec *xml.Decoder, start xml.StartElement, lv *NumLevel) erro
 	}
 }
 
-// decodeNum returns the abstractNumId pointed to by this w:num, or -1.
-func decodeNum(dec *xml.Decoder, start xml.StartElement) (int, error) {
+// decodeNum returns the abstractNumId pointed to by this w:num, and any
+// per-num w:lvlOverride entries the caller will key by numId.
+func decodeNum(dec *xml.Decoder, start xml.StartElement) (int, map[int]NumOverride, error) {
 	abs := -1
+	overrides := map[int]NumOverride{}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
-			return abs, err
+			return abs, overrides, err
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "abstractNumId" {
+			switch t.Name.Local {
+			case "abstractNumId":
 				if v := attr(t, "val"); v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						abs = x
 					}
 				}
+				_ = dec.Skip()
+			case "lvlOverride":
+				ilvl := -1
+				if v := attr(t, "ilvl"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						ilvl = x
+					}
+				}
+				ov, err := decodeLvlOverride(dec, t)
+				if err != nil {
+					return abs, overrides, err
+				}
+				if ilvl >= 0 {
+					overrides[ilvl] = ov
+				}
+			default:
+				_ = dec.Skip()
 			}
-			_ = dec.Skip()
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
-				return abs, nil
+				return abs, overrides, nil
+			}
+		}
+	}
+}
+
+// decodeLvlOverride parses a single <w:lvlOverride> child of a w:num.
+// Recognized children: w:startOverride, w:lvl (full replacement).
+func decodeLvlOverride(dec *xml.Decoder, start xml.StartElement) (NumOverride, error) {
+	ov := NumOverride{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ov, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "startOverride":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						ov.StartOverride = x
+					}
+				}
+				_ = dec.Skip()
+			case "lvl":
+				lv, err := decodeLevel(dec, t)
+				if err != nil {
+					return ov, err
+				}
+				ov.LvlReplace = &lv
+			default:
+				_ = dec.Skip()
+			}
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return ov, nil
 			}
 		}
 	}
@@ -1500,16 +1591,26 @@ func decodeNum(dec *xml.Decoder, start xml.StartElement) (int, error) {
 type xmlRPr struct {
 	RStyle    *xmlValAttr `xml:"rStyle"` // character-style reference
 	B         *struct{}   `xml:"b"`
+	BCs       *struct{}   `xml:"bCs"` // complex-script bold
 	I         *struct{}   `xml:"i"`
+	ICs       *struct{}   `xml:"iCs"`
 	U         *xmlValAttr `xml:"u"`
 	Strike    *struct{}   `xml:"strike"`
 	Caps      *struct{}   `xml:"caps"`
 	SmallCaps *struct{}   `xml:"smallCaps"`
 	Vanish    *struct{}   `xml:"vanish"`
+	WebHidden *struct{}   `xml:"webHidden"`
+	NoProof   *struct{}   `xml:"noProof"`
+	CS        *struct{}   `xml:"cs"`  // complex-script run
+	RTL       *struct{}   `xml:"rtl"` // right-to-left
 	Emboss    *struct{}   `xml:"emboss"`
 	Imprint   *struct{}   `xml:"imprint"`
 	Outline   *struct{}   `xml:"outline"`
-	Sz        *xmlValAttr `xml:"sz"` // half-points
+	Em        *xmlValAttr `xml:"em"`     // CJK emphasis mark
+	Effect    *xmlValAttr `xml:"effect"` // animation effect
+	Sz        *xmlValAttr `xml:"sz"`     // half-points
+	SzCs      *xmlValAttr `xml:"szCs"`
+	Kern      *xmlValAttr `xml:"kern"` // half-points threshold
 	Color     *struct {
 		Val        string `xml:"val,attr"`
 		ThemeColor string `xml:"themeColor,attr"`
@@ -1520,6 +1621,20 @@ type xmlRPr struct {
 	Shd       *struct {
 		Fill string `xml:"fill,attr"`
 	} `xml:"shd"`
+	Bdr *struct {
+		Val   string `xml:"val,attr"`
+		Sz    string `xml:"sz,attr"`
+		Color string `xml:"color,attr"`
+	} `xml:"bdr"`
+	Lang *struct {
+		Val      string `xml:"val,attr"`
+		EastAsia string `xml:"eastAsia,attr"`
+		Bidi     string `xml:"bidi,attr"`
+	} `xml:"lang"`
+	FitText *struct {
+		ID  string `xml:"id,attr"`
+		Val string `xml:"val,attr"` // width in twips
+	} `xml:"fitText"`
 	VertAlign *xmlValAttr `xml:"vertAlign"` // "superscript" | "subscript"
 	Position  *xmlValAttr `xml:"position"`  // half-points; +up / -down
 	WAttr     *xmlValAttr `xml:"w"`         // character scale percent (100 = normal)
@@ -1528,6 +1643,7 @@ type xmlRPr struct {
 		ASCII      string `xml:"ascii,attr"`
 		HAnsi      string `xml:"hAnsi,attr"`
 		EA         string `xml:"eastAsia,attr"`
+		CS         string `xml:"cs,attr"`
 		AsciiTheme string `xml:"asciiTheme,attr"`
 		HAnsiTheme string `xml:"hAnsiTheme,attr"`
 		EATheme    string `xml:"eastAsiaTheme,attr"`
@@ -1619,6 +1735,61 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 		if x, err := strconv.Atoi(r.Spacing.Val); err == nil {
 			p.LetterSpacingPt = float64(x) / 20.0
 		}
+	}
+	if r.Em != nil && r.Em.Val != "" && r.Em.Val != "none" {
+		p.Em = r.Em.Val
+	}
+	if r.NoProof != nil {
+		p.NoProof = true
+	}
+	if r.WebHidden != nil {
+		p.WebHidden = true
+	}
+	if r.RTL != nil {
+		p.RTL = true
+	}
+	if r.CS != nil {
+		p.CS = true
+	}
+	if r.BCs != nil {
+		p.BCs = true
+	}
+	if r.ICs != nil {
+		p.ICs = true
+	}
+	if r.SzCs != nil && r.SzCs.Val != "" {
+		if hp, err := strconv.ParseFloat(r.SzCs.Val, 64); err == nil {
+			p.SzCs = hp / 2
+		}
+	}
+	if r.Kern != nil && r.Kern.Val != "" {
+		if hp, err := strconv.ParseFloat(r.Kern.Val, 64); err == nil {
+			p.KernThresholdPt = hp / 2
+		}
+	}
+	if r.FitText != nil && r.FitText.Val != "" {
+		if x, err := strconv.Atoi(r.FitText.Val); err == nil {
+			p.FitTextWidthPt = float64(x) / 20.0
+		}
+		if r.FitText.ID != "" {
+			if x, err := strconv.Atoi(r.FitText.ID); err == nil {
+				p.FitTextID = x
+			}
+		}
+	}
+	if r.Bdr != nil {
+		edge := BorderEdge{Style: r.Bdr.Val, Color: r.Bdr.Color}
+		if r.Bdr.Sz != "" {
+			if x, err := strconv.Atoi(r.Bdr.Sz); err == nil {
+				edge.Sz = float64(x) / 8.0
+			}
+		}
+		if edge.Style != "" && edge.Style != "none" {
+			p.TextBorder = edge
+		}
+	}
+	if r.Lang != nil {
+		p.Lang = RunLang{Latin: r.Lang.Val, EastAsia: r.Lang.EastAsia, Bidi: r.Lang.Bidi}
 	}
 	if r.RFonts != nil {
 		switch {
@@ -2222,6 +2393,60 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 			case "bidi":
 				p.Bidi = onOff(t)
 				_ = dec.Skip()
+			case "mirrorIndents":
+				p.MirrorIndents = onOff(t)
+				_ = dec.Skip()
+			case "adjustRightInd":
+				p.AdjustRightInd = onOff(t)
+				_ = dec.Skip()
+			case "snapToGrid":
+				v := onOff(t)
+				p.SnapToGrid = &v
+				_ = dec.Skip()
+			case "widowControl":
+				v := onOff(t)
+				p.WidowControl = &v
+				_ = dec.Skip()
+			case "outlineLvl":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						// Word stores 0..8 here (Heading1..Heading9); 9 means
+						// "body text". Use +1 internally to distinguish 0 from
+						// "unset" (the zero value of int).
+						p.OutlineLvl = x + 1
+					}
+				}
+				_ = dec.Skip()
+			case "textDirection":
+				p.TextDirection = attr(t, "val")
+				_ = dec.Skip()
+			case "textAlignment":
+				p.TextAlignment = attr(t, "val")
+				_ = dec.Skip()
+			case "kinsoku":
+				v := onOff(t)
+				p.Kinsoku = &v
+				_ = dec.Skip()
+			case "wordWrap":
+				v := onOff(t)
+				p.WordWrap = &v
+				_ = dec.Skip()
+			case "overflowPunct":
+				v := onOff(t)
+				p.OverflowPunct = &v
+				_ = dec.Skip()
+			case "topLinePunct":
+				v := onOff(t)
+				p.TopLinePunct = &v
+				_ = dec.Skip()
+			case "autoSpaceDE":
+				v := onOff(t)
+				p.AutoSpaceDE = &v
+				_ = dec.Skip()
+			case "autoSpaceDN":
+				v := onOff(t)
+				p.AutoSpaceDN = &v
+				_ = dec.Skip()
 			case "tabs":
 				if err := decodeTabs(dec, t, p); err != nil {
 					return err
@@ -2434,14 +2659,20 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 				if di.RID != "" {
 					atoms = append(atoms, Run{
-						ImageID:       di.RID,
-						ImageWidthPt:  di.WPt,
-						ImageHeightPt: di.HPt,
-						CropTopPct:    di.CropT,
-						CropBottomPct: di.CropB,
-						CropLeftPct:   di.CropL,
-						CropRightPct:  di.CropR,
-						Props:         rp,
+						ImageID:         di.RID,
+						ImageWidthPt:    di.WPt,
+						ImageHeightPt:   di.HPt,
+						CropTopPct:      di.CropT,
+						CropBottomPct:   di.CropB,
+						CropLeftPct:     di.CropL,
+						CropRightPct:    di.CropR,
+						ImageAnchored:   di.IsAnchor,
+						AnchorAlignH:    di.PosH.Align,
+						AnchorAlignV:    di.PosV.Align,
+						AnchorOffsetXPt: di.PosH.OffsetPt(),
+						AnchorOffsetYPt: di.PosV.OffsetPt(),
+						AnchorWrap:      di.WrapType,
+						Props:           rp,
 					})
 				}
 				// Text-box body (wps:txbx) accompanies any image content
@@ -2552,6 +2783,31 @@ type drawingInfo struct {
 	// via <dgm:relIds r:dm="…">. The renderer looks up
 	// Document.Diagrams[DiagramRID] for the flattened node text.
 	DiagramRID string
+	// IsAnchor is true when the drawing comes from a wp:anchor (floating)
+	// rather than wp:inline. We don't currently implement text wrap so
+	// the run still renders inline, but the flag is preserved so the
+	// renderer can apply best-effort offset / alignment from PosH/PosV.
+	IsAnchor bool
+	// PosH / PosV mirror wp:positionH / wp:positionV.
+	PosH, PosV DrawingPos
+	// WrapType is "" (no wrap = the wp:anchor used wrapNone or no wrap
+	// element), "square", "tight", "through", "topAndBottom", "behind",
+	// "inFront".
+	WrapType string
+}
+
+// DrawingPos mirrors wp:positionH / wp:positionV — either an absolute
+// offset in EMU OR an alignment keyword, relative to one of several
+// anchor frames.
+type DrawingPos struct {
+	RelativeFrom string // "page" / "margin" / "column" / "paragraph" / "character" / "line"
+	Align        string // "left" / "center" / "right" / "inside" / "outside" / "top" / "bottom"
+	OffsetEMU    int64  // when Align is empty, the absolute offset in EMU
+}
+
+// OffsetPt returns the offset in PostScript points (0 if Align is set).
+func (d DrawingPos) OffsetPt() float64 {
+	return float64(d.OffsetEMU) / emuPerPt
 }
 
 // emuPerPt is the OOXML "English Metric Unit" → PostScript point conversion.
@@ -2563,6 +2819,9 @@ const emuPerPt = 12700.0
 // srcRect: each side is in 1/1000ths of a percent (so 10000 = 10%).
 func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo, err error) {
 	depth := 1
+	// Position-decoding context: when we're inside a positionH / positionV
+	// element we capture children into the appropriate DrawingPos.
+	posTarget := "" // "" / "H" / "V"
 	for depth > 0 {
 		tok, e := dec.Token()
 		if e != nil {
@@ -2572,6 +2831,44 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 		case xml.StartElement:
 			depth++
 			switch t.Name.Local {
+			case "anchor":
+				info.IsAnchor = true
+			case "positionH":
+				posTarget = "H"
+				info.PosH.RelativeFrom = attr(t, "relativeFrom")
+			case "positionV":
+				posTarget = "V"
+				info.PosV.RelativeFrom = attr(t, "relativeFrom")
+			case "align":
+				val, _ := readElementText(dec, t)
+				depth-- // readElementText consumed the EndElement
+				switch posTarget {
+				case "H":
+					info.PosH.Align = val
+				case "V":
+					info.PosV.Align = val
+				}
+			case "posOffset":
+				val, _ := readElementText(dec, t)
+				depth--
+				if x, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
+					switch posTarget {
+					case "H":
+						info.PosH.OffsetEMU = x
+					case "V":
+						info.PosV.OffsetEMU = x
+					}
+				}
+			case "wrapNone":
+				info.WrapType = "none"
+			case "wrapSquare":
+				info.WrapType = "square"
+			case "wrapTight":
+				info.WrapType = "tight"
+			case "wrapThrough":
+				info.WrapType = "through"
+			case "wrapTopAndBottom":
+				info.WrapType = "topAndBottom"
 			case "blip":
 				for _, a := range t.Attr {
 					if a.Name.Local == "embed" {
@@ -2646,9 +2943,37 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 			}
 		case xml.EndElement:
 			depth--
+			switch t.Name.Local {
+			case "positionH", "positionV":
+				posTarget = ""
+			}
 		}
 	}
 	return info, nil
+}
+
+// readElementText returns the concatenated CharData inside the current
+// element, consuming up to and including its EndElement. Used for
+// alignment / offset values that live as text content.
+func readElementText(dec *xml.Decoder, start xml.StartElement) (string, error) {
+	var sb []byte
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return string(sb), err
+		}
+		switch t := tok.(type) {
+		case xml.CharData:
+			sb = append(sb, t...)
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return string(sb), nil
+			}
+		case xml.StartElement:
+			// Unexpected nested element — skip to keep walker simple.
+			_ = dec.Skip()
+		}
+	}
 }
 
 // extractTxbxText concatenates the visible text inside a w:txbxContent
@@ -2954,6 +3279,48 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 					return err
 				}
 				continue
+			case "tblLayout":
+				tbl.Layout = attr(t, "type")
+			case "tblOverlap":
+				tbl.Overlap = attr(t, "val")
+			case "tblCaption":
+				tbl.Caption = attr(t, "val")
+			case "tblDescription":
+				tbl.Description = attr(t, "val")
+			case "tblW":
+				tbl.TableWidthType = attr(t, "type")
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						tbl.TableWidthTwips = x
+					}
+				}
+			case "tblpPr":
+				fp := &TableFloatPos{
+					HAnchor: attr(t, "horzAnchor"),
+					VAnchor: attr(t, "vertAnchor"),
+					XAlign:  attr(t, "tblpXSpec"),
+					YAlign:  attr(t, "tblpYSpec"),
+				}
+				parseInt := func(name string) int {
+					if v := attr(t, name); v != "" {
+						if x, err := strconv.Atoi(v); err == nil {
+							return x
+						}
+					}
+					return 0
+				}
+				fp.XTwips = parseInt("tblpX")
+				fp.YTwips = parseInt("tblpY")
+				fp.LeftFromTextTwips = parseInt("leftFromText")
+				fp.RightFromTextTwips = parseInt("rightFromText")
+				fp.TopFromTextTwips = parseInt("topFromText")
+				fp.BottomFromTextTwips = parseInt("bottomFromText")
+				tbl.FloatPos = fp
+			case "tblCellMar":
+				if err := decodeTblCellMar(dec, t, &tbl.DefaultCellMargins); err != nil {
+					return err
+				}
+				continue
 			case "tblLook":
 				// Word can encode either via individual w:firstRow="1" attrs
 				// or via a single w:val hex bitmask. Handle both.
@@ -2975,6 +3342,40 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 				if flagSet(attr(t, "noVBand")) {
 					tbl.Look.NoVBand = true
 				}
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
+			}
+		}
+	}
+}
+
+// decodeTblCellMar reads w:tblCellMar — table-default cell margins.
+func decodeTblCellMar(dec *xml.Decoder, start xml.StartElement, m *CellMargins) error {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			pt := 0.0
+			if v := attr(t, "w"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil {
+					pt = float64(x) / 20.0
+				}
+			}
+			switch t.Name.Local {
+			case "top":
+				m.Top = pt
+			case "bottom":
+				m.Bottom = pt
+			case "left", "start":
+				m.Left = pt
+			case "right", "end":
+				m.Right = pt
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3044,6 +3445,14 @@ func decodeRow(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContext) 
 }
 
 func decodeTrPr(dec *xml.Decoder, start xml.StartElement, row *TableRow) error {
+	parseTwips := func(t xml.StartElement) int {
+		if v := attr(t, "w"); v != "" {
+			if x, err := strconv.Atoi(v); err == nil {
+				return x
+			}
+		}
+		return 0
+	}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -3071,6 +3480,12 @@ func decodeTrPr(dec *xml.Decoder, start xml.StartElement, row *TableRow) error {
 				if v == "" || v == "1" || v == "true" {
 					row.CantSplit = true
 				}
+			case "wBefore":
+				row.WBeforeTwips = parseTwips(t)
+			case "wAfter":
+				row.WAfterTwips = parseTwips(t)
+			case "tblCellSpacing":
+				row.CellSpacingTwips = parseTwips(t)
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3154,6 +3569,21 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 				}
 				cell.VMerge = v
 				_ = dec.Skip()
+			case "hMerge":
+				v := attr(t, "val")
+				if v == "" {
+					v = "continue"
+				}
+				cell.HMerge = v
+				_ = dec.Skip()
+			case "tcW":
+				cell.CellWidthType = attr(t, "type")
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						cell.CellWidthTwips = x
+					}
+				}
+				_ = dec.Skip()
 			case "shd":
 				if v := attr(t, "fill"); v != "" && v != "auto" {
 					cell.Shading = v
@@ -3161,6 +3591,18 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 				_ = dec.Skip()
 			case "vAlign":
 				cell.VAlign = attr(t, "val")
+				_ = dec.Skip()
+			case "textDirection":
+				cell.TextDirection = attr(t, "val")
+				_ = dec.Skip()
+			case "noWrap":
+				cell.NoWrap = onOff(t)
+				_ = dec.Skip()
+			case "hideMark":
+				cell.HideMark = onOff(t)
+				_ = dec.Skip()
+			case "tcFitText":
+				cell.FitText = onOff(t)
 				_ = dec.Skip()
 			case "tcBorders":
 				if err := decodeCellBorders(dec, t, &cell.Borders); err != nil {
@@ -3411,7 +3853,49 @@ func decodeSectPr(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContex
 				if v := attr(t, "fmt"); v != "" {
 					sec.PageNumber.Fmt = v
 				}
+				if v := attr(t, "chapStyle"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						sec.PageNumber.ChapStyle = x
+					}
+				}
+				if v := attr(t, "chapSep"); v != "" {
+					sec.PageNumber.ChapSep = v
+				}
 				_ = dec.Skip()
+			case "vAlign":
+				sec.VAlign = attr(t, "val")
+				_ = dec.Skip()
+			case "docGrid":
+				sec.DocGrid.Type = attr(t, "type")
+				if v := attr(t, "linePitch"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						sec.DocGrid.LinePitch = x
+					}
+				}
+				if v := attr(t, "charSpace"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						sec.DocGrid.CharSpace = x
+					}
+				}
+				_ = dec.Skip()
+			case "formProt":
+				sec.FormProt = onOff(t)
+				_ = dec.Skip()
+			case "rtlGutter":
+				sec.RtlGutter = onOff(t)
+				_ = dec.Skip()
+			case "footnotePr":
+				nc, err := decodeNoteConfig(dec, t)
+				if err != nil {
+					return err
+				}
+				sec.FootnotePr = nc
+			case "endnotePr":
+				nc, err := decodeNoteConfig(dec, t)
+				if err != nil {
+					return err
+				}
+				sec.EndnotePr = nc
 			case "pgBorders":
 				if err := decodePgBorders(dec, t, &sec.Borders); err != nil {
 					return err
@@ -3487,6 +3971,40 @@ func decodeSectPr(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContex
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
 				return nil
+			}
+		}
+	}
+}
+
+// decodeNoteConfig parses a w:footnotePr / w:endnotePr block into NoteConfig.
+// Children we recognize: w:pos, w:numFmt, w:numStart, w:numRestart.
+func decodeNoteConfig(dec *xml.Decoder, start xml.StartElement) (*NoteConfig, error) {
+	nc := &NoteConfig{}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nc, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "pos":
+				nc.Pos = attr(t, "val")
+			case "numFmt":
+				nc.NumFmt = attr(t, "val")
+			case "numStart":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						nc.NumStart = x
+					}
+				}
+			case "numRestart":
+				nc.Restart = attr(t, "val")
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nc, nil
 			}
 		}
 	}

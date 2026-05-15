@@ -87,14 +87,20 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 				}
 				if di.RID != "" {
 					out = append(out, Run{
-						ImageID:       di.RID,
-						ImageWidthPt:  di.WPt,
-						ImageHeightPt: di.HPt,
-						CropTopPct:    di.CropT,
-						CropBottomPct: di.CropB,
-						CropLeftPct:   di.CropL,
-						CropRightPct:  di.CropR,
-						Props:         rp,
+						ImageID:         di.RID,
+						ImageWidthPt:    di.WPt,
+						ImageHeightPt:   di.HPt,
+						CropTopPct:      di.CropT,
+						CropBottomPct:   di.CropB,
+						CropLeftPct:     di.CropL,
+						CropRightPct:    di.CropR,
+						ImageAnchored:   di.IsAnchor,
+						AnchorAlignH:    di.PosH.Align,
+						AnchorAlignV:    di.PosV.Align,
+						AnchorOffsetXPt: di.PosH.OffsetPt(),
+						AnchorOffsetYPt: di.PosV.OffsetPt(),
+						AnchorWrap:      di.WrapType,
+						Props:           rp,
 					})
 				}
 				if di.TxbxText != "" {
