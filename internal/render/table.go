@@ -50,6 +50,7 @@ func (r *renderer) applyTableStyleToCells(t *docx.Table) {
 
 func (r *renderer) drawTable(t docx.Table) error {
 	r.applyTableStyleToCells(&t)
+	r.resolveHMerge(&t)
 	cols := 0
 	for _, row := range t.Rows {
 		if len(row.Cells) > cols {
@@ -59,37 +60,7 @@ func (r *renderer) drawTable(t docx.Table) error {
 	if cols == 0 {
 		return nil
 	}
-	widths := make([]float64, cols)
-	if len(t.ColumnWidthsTwips) == cols {
-		total := 0
-		for _, w := range t.ColumnWidthsTwips {
-			total += w
-		}
-		if total > 0 {
-			// Use the docx-specified twip widths directly. Word stores
-			// these as absolute and renders the table at exactly that
-			// width — even when it overflows the page margin. Our
-			// previous proportional-to-contentW scaling silently
-			// shrank columns whenever the table was slightly wider than
-			// the page, which forced text like "Name" in a narrow
-			// header column to wrap mid-word ("Nam\ne"). Only fall back
-			// to scaling when total exceeds contentW by a meaningful
-			// margin AND no column width is itself wider than contentW
-			// (i.e. don't try to fit a fundamentally over-wide table
-			// that would just clip glyphs anyway).
-			for i, w := range t.ColumnWidthsTwips {
-				widths[i] = float64(w) / 20.0 // twips → pt
-			}
-		} else {
-			for i := range widths {
-				widths[i] = r.contentW / float64(cols)
-			}
-		}
-	} else {
-		for i := range widths {
-			widths[i] = r.contentW / float64(cols)
-		}
-	}
+	widths := r.resolveColumnWidths(t, cols)
 
 	// Header rows repeat after each page break (leading consecutive
 	// header-flagged rows per ECMA-376).
@@ -124,6 +95,150 @@ func (r *renderer) drawTable(t docx.Table) error {
 		}
 	}
 	return nil
+}
+
+// resolveColumnWidths returns the per-column widths in points. It honors,
+// in priority order:
+//  1. The table's w:tblGrid (most reliable; one entry per column).
+//  2. Per-cell w:tcW in the first non-merged row (used when tblGrid is
+//     missing or doesn't match column count).
+//  3. Equal division of contentW (fallback).
+//
+// When the table's w:tblW declares a pct (50% of contentW), the column
+// widths are scaled to match. When w:tblLayout is "autofit" and the table
+// is wider than contentW, columns are proportionally shrunk so the table
+// fits — the previous behavior was to overflow the page margin.
+func (r *renderer) resolveColumnWidths(t docx.Table, cols int) []float64 {
+	widths := make([]float64, cols)
+
+	// First, derive a starting set of widths.
+	gridUsable := len(t.ColumnWidthsTwips) == cols
+	if gridUsable {
+		gridTotal := 0
+		for _, w := range t.ColumnWidthsTwips {
+			gridTotal += w
+		}
+		if gridTotal > 0 {
+			for i, w := range t.ColumnWidthsTwips {
+				widths[i] = float64(w) / 20.0
+			}
+		} else {
+			gridUsable = false
+		}
+	}
+	if !gridUsable {
+		// Try to recover column widths from the first row's tcW values
+		// (covers tables that ship without a w:tblGrid).
+		if len(t.Rows) > 0 {
+			row := t.Rows[0]
+			col := 0
+			anyTcW := false
+			for _, cell := range row.Cells {
+				span := cell.GridSpan
+				if span < 1 {
+					span = 1
+				}
+				if cell.CellWidthType == "dxa" && cell.CellWidthTwips > 0 {
+					per := float64(cell.CellWidthTwips) / 20.0 / float64(span)
+					for k := 0; k < span && col+k < cols; k++ {
+						widths[col+k] = per
+					}
+					anyTcW = true
+				}
+				col += span
+			}
+			if !anyTcW {
+				for i := range widths {
+					widths[i] = r.contentW / float64(cols)
+				}
+			} else {
+				// Fill unset columns with the mean of the known widths.
+				known, n := 0.0, 0
+				for _, w := range widths {
+					if w > 0 {
+						known += w
+						n++
+					}
+				}
+				if n > 0 {
+					mean := known / float64(n)
+					for i := range widths {
+						if widths[i] == 0 {
+							widths[i] = mean
+						}
+					}
+				}
+			}
+		} else {
+			for i := range widths {
+				widths[i] = r.contentW / float64(cols)
+			}
+		}
+	}
+
+	// Apply w:tblW pct override: column widths are scaled to occupy
+	// (pct / 5000) of contentW. Word stores pct in 50ths of a percent
+	// (5000 = 100%).
+	if t.TableWidthType == "pct" && t.TableWidthTwips > 0 {
+		target := float64(t.TableWidthTwips) / 5000.0 * r.contentW
+		sum := 0.0
+		for _, w := range widths {
+			sum += w
+		}
+		if sum > 0 {
+			scale := target / sum
+			for i := range widths {
+				widths[i] *= scale
+			}
+		}
+	}
+
+	// w:tblLayout="autofit" (default in Word for non-fixed tables) plus
+	// total > contentW: scale columns down so the table fits. With
+	// Layout="fixed" we respect the absolute widths even if they
+	// overflow, since the source explicitly asked for that.
+	if t.Layout != "fixed" {
+		sum := 0.0
+		for _, w := range widths {
+			sum += w
+		}
+		if sum > r.contentW*1.05 {
+			scale := r.contentW / sum
+			for i := range widths {
+				widths[i] *= scale
+			}
+		}
+	}
+	return widths
+}
+
+// resolveHMerge folds w:hMerge="continue" cells into their preceding
+// "restart" cell by widening that cell's GridSpan. We then drop the
+// continuation cells from the row. This matches what GridSpan would have
+// produced if the doc had used it instead.
+func (r *renderer) resolveHMerge(t *docx.Table) {
+	for ri := range t.Rows {
+		row := &t.Rows[ri]
+		// Walk left-to-right; collapse runs of "continue" into the
+		// nearest preceding non-continue cell.
+		out := make([]docx.TableCell, 0, len(row.Cells))
+		for _, cell := range row.Cells {
+			if cell.HMerge == "continue" && len(out) > 0 {
+				last := &out[len(out)-1]
+				span := cell.GridSpan
+				if span < 1 {
+					span = 1
+				}
+				if last.GridSpan < 1 {
+					last.GridSpan = 1
+				}
+				last.GridSpan += span
+				continue
+			}
+			out = append(out, cell)
+		}
+		row.Cells = out
+	}
 }
 
 // predictRowHeight computes the row's rendered height without drawing

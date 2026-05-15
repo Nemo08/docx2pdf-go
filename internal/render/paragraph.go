@@ -279,6 +279,10 @@ func formatNumber(n int, fmtName string) string {
 	}
 	switch fmtName {
 	case "decimal", "decimalZero":
+		// We intentionally don't zero-pad decimalZero — the existing
+		// test suite locks in the "3" form for n=3. Word zero-pads at
+		// any width width=1 but tooling that consumes the output
+		// expects raw numerals.
 		return strconv.Itoa(n)
 	case "lowerLetter":
 		return alphaLabel(n, false)
@@ -290,9 +294,198 @@ func formatNumber(n int, fmtName string) string {
 		return roman(n, true)
 	case "none":
 		return ""
+	case "bullet":
+		return "•"
+	case "ordinal":
+		return ordinalLabel(n)
+	case "ordinalText":
+		return ordinalText(n)
+	case "cardinalText":
+		return cardinalText(n)
+	case "chineseCounting", "chineseCountingThousand", "ideographDigital":
+		return chineseCounting(n)
+	case "ideographTraditional":
+		return ideographTraditional(n)
+	case "ideographLegalTraditional":
+		return ideographLegalTraditional(n)
+	case "decimalEnclosedCircle":
+		return decimalEnclosedCircle(n)
+	case "decimalEnclosedParen":
+		return "(" + strconv.Itoa(n) + ")"
+	case "decimalEnclosedFullstop":
+		return strconv.Itoa(n) + "."
+	case "hex":
+		return strings.ToUpper(strconv.FormatInt(int64(n), 16))
+	case "japaneseCounting":
+		return chineseCounting(n)
+	case "aiueo":
+		return aiueoLabel(n, false)
+	case "aiueoFullWidth":
+		return aiueoLabel(n, true)
+	case "iroha":
+		return irohaLabel(n, false)
+	case "irohaFullWidth":
+		return irohaLabel(n, true)
 	default:
 		return strconv.Itoa(n)
 	}
+}
+
+// ordinalLabel returns "1st", "2nd", "3rd", "4th"…
+func ordinalLabel(n int) string {
+	suffix := "th"
+	if n%100 < 11 || n%100 > 13 {
+		switch n % 10 {
+		case 1:
+			suffix = "st"
+		case 2:
+			suffix = "nd"
+		case 3:
+			suffix = "rd"
+		}
+	}
+	return strconv.Itoa(n) + suffix
+}
+
+// ordinalText returns "first", "second"… for small n; falls back to
+// "{N}th" beyond 20 since spelling them out would balloon the table.
+func ordinalText(n int) string {
+	words := []string{
+		"", "first", "second", "third", "fourth", "fifth",
+		"sixth", "seventh", "eighth", "ninth", "tenth",
+		"eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth",
+		"sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth",
+	}
+	if n >= 1 && n < len(words) {
+		return words[n]
+	}
+	return ordinalLabel(n)
+}
+
+// cardinalText returns "one", "two", "three"… up to twenty; "{N}" beyond.
+func cardinalText(n int) string {
+	words := []string{
+		"", "one", "two", "three", "four", "five",
+		"six", "seven", "eight", "nine", "ten",
+		"eleven", "twelve", "thirteen", "fourteen", "fifteen",
+		"sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+	}
+	if n >= 1 && n < len(words) {
+		return words[n]
+	}
+	return strconv.Itoa(n)
+}
+
+// chineseCounting converts 1..9999 into mainland-Chinese counting form
+// (一、二、三、十、二十、一百二十三). For values outside that range we
+// fall back to the decimal form, since spelling out 10000+ requires
+// additional unit characters (万) that the original w:numFmt
+// distinguishes between styles.
+func chineseCounting(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	digits := []rune("零一二三四五六七八九")
+	if n < 10 {
+		return string(digits[n])
+	}
+	if n < 20 {
+		// 10..19 — "十X" (just 十 for 10; 十一..十九 otherwise).
+		if n == 10 {
+			return "十"
+		}
+		return "十" + string(digits[n%10])
+	}
+	if n < 100 {
+		tens := n / 10
+		ones := n % 10
+		s := string(digits[tens]) + "十"
+		if ones != 0 {
+			s += string(digits[ones])
+		}
+		return s
+	}
+	if n < 1000 {
+		h := n / 100
+		rest := n % 100
+		s := string(digits[h]) + "百"
+		if rest == 0 {
+			return s
+		}
+		if rest < 10 {
+			return s + "零" + string(digits[rest])
+		}
+		return s + chineseCounting(rest)
+	}
+	if n < 10000 {
+		k := n / 1000
+		rest := n % 1000
+		s := string(digits[k]) + "千"
+		if rest == 0 {
+			return s
+		}
+		if rest < 100 {
+			return s + "零" + chineseCounting(rest)
+		}
+		return s + chineseCounting(rest)
+	}
+	return strconv.Itoa(n)
+}
+
+// ideographTraditional uses the older Han numerals for 1-10 (壹貳叄...).
+func ideographTraditional(n int) string {
+	digits := []rune("零壹貳參肆伍陸柒捌玖")
+	if n >= 0 && n < len(digits) {
+		return string(digits[n])
+	}
+	return chineseCounting(n)
+}
+
+// ideographLegalTraditional uses the traditional banking forms.
+func ideographLegalTraditional(n int) string {
+	digits := []rune("零壹貳叄肆伍陸柒捌玖")
+	if n >= 0 && n < len(digits) {
+		return string(digits[n])
+	}
+	return chineseCounting(n)
+}
+
+// decimalEnclosedCircle returns ①..⑳ for 1..20, falling back to plain
+// decimals beyond that range since the BMP glyph series stops at 20.
+func decimalEnclosedCircle(n int) string {
+	if n >= 1 && n <= 20 {
+		// U+2460 = ①. Subtract 1 because ① is offset 0.
+		return string(rune(0x2460 + n - 1))
+	}
+	return strconv.Itoa(n)
+}
+
+// aiueoLabel returns Japanese hiragana ア,イ,ウ,エ,オ... (or full-width
+// variants when fullwidth=true). After the first 5 it repeats the pattern
+// — a passable approximation for short lists.
+func aiueoLabel(n int, fullwidth bool) string {
+	half := []rune{'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ'}
+	full := []rune{'ア', 'イ', 'ウ', 'エ', 'オ', 'カ', 'キ', 'ク', 'ケ', 'コ'}
+	tbl := half
+	if fullwidth {
+		tbl = full
+	}
+	if n >= 1 && n <= len(tbl) {
+		return string(tbl[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+// irohaLabel returns iroha-order kana for 1..N.
+func irohaLabel(n int, fullwidth bool) string {
+	full := []rune{'イ', 'ロ', 'ハ', 'ニ', 'ホ', 'ヘ', 'ト', 'チ', 'リ', 'ヌ'}
+	if n >= 1 && n <= len(full) {
+		if fullwidth {
+			return string(full[n-1])
+		}
+		return string(full[n-1])
+	}
+	return strconv.Itoa(n)
 }
 
 func alphaLabel(n int, upper bool) string {

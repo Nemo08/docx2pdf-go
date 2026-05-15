@@ -18,6 +18,11 @@ type atom struct {
 	fontFamily string
 	width      float64
 	height     float64
+	// anchored signals an image from wp:anchor (floating). When true the
+	// renderer respects anchorAlignH for horizontal placement instead of
+	// drawing at the inline cursor.
+	anchored     bool
+	anchorAlignH string // "left", "center", "right", "inside", "outside"
 }
 
 type atomKind int
@@ -177,7 +182,17 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			} else {
 				w, h = r.fitImage(img)
 			}
-			out = append(out, atom{kind: atomImage, imageID: imgID, width: w, height: h, props: run.Props, linkRID: run.LinkURL, linkAnchor: run.LinkAnchor})
+			out = append(out, atom{
+				kind:         atomImage,
+				imageID:      imgID,
+				width:        w,
+				height:       h,
+				props:        run.Props,
+				linkRID:      run.LinkURL,
+				linkAnchor:   run.LinkAnchor,
+				anchored:     run.ImageAnchored,
+				anchorAlignH: run.AnchorAlignH,
+			})
 			continue
 		}
 		if run.IsBreak {
@@ -503,10 +518,31 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				if img == nil {
 					continue
 				}
-				if err := r.drawImage(img, cx, r.cursorY, a.width, a.height); err != nil {
+				// For anchored (wp:anchor) images, honor positionH alignment.
+				// We can't implement full text-wrap layout, but we can at
+				// least shift the image horizontally so it lands roughly
+				// where the source asked. Vertical alignment is intentionally
+				// not adjusted — we still draw at the current cursor y so
+				// the surrounding flow text isn't pushed.
+				imgX := cx
+				if a.anchored {
+					switch a.anchorAlignH {
+					case "right", "outside":
+						imgX = r.marL + r.contentW - a.width
+					case "center":
+						imgX = r.marL + (r.contentW-a.width)/2
+					case "left", "inside":
+						imgX = r.marL
+					}
+				}
+				if err := r.drawImage(img, imgX, r.cursorY, a.width, a.height); err != nil {
 					return err
 				}
-				cx += a.width
+				if a.anchored {
+					// Anchored image — don't advance the inline cursor.
+				} else {
+					cx += a.width
+				}
 			}
 		}
 
