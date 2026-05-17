@@ -23,6 +23,24 @@ type atom struct {
 	// drawing at the inline cursor.
 	anchored     bool
 	anchorAlignH string // "left", "center", "right", "inside", "outside"
+	// anchorWrap mirrors w:wrap on wp:anchor: "" (none/behind/through —
+	// no flow effect), "topAndBottom", "square", "tight". For
+	// topAndBottom we force a line break before and after the image so
+	// body text doesn't overlap. square/tight downgrade to topAndBottom
+	// since true shape-exclusion layout is out of scope.
+	anchorWrap string
+	// anchorOffsetXPt / anchorOffsetYPt mirror w:positionH/positionV w:posOffset
+	// in points. When AnchorAlignH is empty, the renderer places the
+	// floating image at (marL+OffsetX, currentY+OffsetY). When wrap is
+	// "none"/"behind", these are also used to draw the image without
+	// affecting flow text.
+	anchorOffsetXPt, anchorOffsetYPt float64
+	// shape, when non-nil, carries a VML geometric primitive that should
+	// be drawn at the current cursor position.
+	shape *docx.VMLShape
+	// math, when non-zero, carries a pre-laid-out OMML expression box.
+	// Drawn at the line's baseline at draw time.
+	math mathBox
 }
 
 type atomKind int
@@ -35,6 +53,8 @@ const (
 	atomImage
 	atomTab
 	atomBookmark // zero-width marker; registers a named PDF anchor at this position
+	atomVMLShape // inline geometric primitive (v:rect/v:line/v:oval/...)
+	atomMath     // 2D-laid-out OMML expression
 )
 
 // nextTabAfterWithAlign returns the next tab stop strictly past relX
@@ -44,6 +64,11 @@ const (
 // half-inch (720 twips) Word default.
 func (r *renderer) nextTabAfterWithAlign(relX float64, p docx.RunProps) (float64, string, string, bool) {
 	for _, ts := range r.activeTabs {
+		// w:val="bar" is a decorative vertical rule, not a stop the cursor
+		// advances to. Skip when looking for the next actual stop.
+		if ts.Val == "bar" {
+			continue
+		}
 		if ts.Pos > relX+0.5 {
 			return ts.Pos, ts.Leader, ts.Val, true
 		}
@@ -60,6 +85,21 @@ func (r *renderer) nextTabAfterWithAlign(relX float64, p docx.RunProps) (float64
 		return 0, "", "", false
 	}
 	return next, "", "", true
+}
+
+// drawBarTabsForLine paints a vertical rule at every w:tab w:val="bar"
+// position. lineLeftX is the paragraph's left start for this line; the
+// rule spans the line's full vertical extent.
+func (r *renderer) drawBarTabsForLine(lineLeftX, top, height float64) {
+	for _, ts := range r.activeTabs {
+		if ts.Val != "bar" {
+			continue
+		}
+		x := lineLeftX + ts.Pos
+		r.pdf.SetLineWidth(0.5)
+		r.pdf.SetStrokeColor(0, 0, 0)
+		r.pdf.Line(x, top, x, top+height)
+	}
 }
 
 // drawTabLeader fills the gap between fromX..toX with the leader pattern.
@@ -142,33 +182,131 @@ func transformText(s string, p docx.RunProps) string {
 
 func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 	runs = flattenFields(runs, r.fields)
+	runs = r.applyRevisionPolicy(runs)
 	var out []atom
 	for _, run := range runs {
 		if run.Props.Vanish {
 			continue
 		}
+		// Complex-script substitution: when the run is tagged w:cs (or
+		// rendered inside an RTL paragraph), Word reads bold/italic/size
+		// from the complex-script siblings (BCs/ICs/SzCs) rather than the
+		// Latin attrs. Doing this here means downstream layout, atom
+		// construction, and font selection all see the corrected props
+		// without each having to know about the cs/bidi split.
+		run.Props = applyComplexScriptProps(run.Props, r.paragraphRTL)
 		if run.FootnoteID != "" && !r.drawingFootnotes {
 			r.pendingFootnotes = append(r.pendingFootnotes, pendingNote{
 				id: run.FootnoteID, endnote: run.IsEndnote,
 			})
+			// Rewrite the reference text from "[id]" to the configured
+			// label (decimal/roman/letter/symbol).
+			labels := r.footnoteLabels
+			if run.IsEndnote {
+				labels = r.endnoteLabels
+			}
+			if labels != nil {
+				if lbl, ok := labels[run.FootnoteID]; ok && lbl != "" {
+					run.Text = lbl
+				}
+			}
 		}
 		if run.Bookmark != "" {
 			out = append(out, atom{kind: atomBookmark, text: run.Bookmark})
 			continue
 		}
+		if run.VMLShape != nil {
+			s := run.VMLShape
+			w, h := s.WidthPt, s.HeightPt
+			if w <= 0 {
+				w = 48
+			}
+			if h <= 0 {
+				h = 24
+			}
+			if w > r.contentW {
+				scale := r.contentW / w
+				w *= scale
+				h *= scale
+			}
+			out = append(out, atom{
+				kind:   atomVMLShape,
+				shape:  s,
+				width:  w,
+				height: h,
+				props:  run.Props,
+			})
+			continue
+		}
 		if run.ImageID != "" {
 			img, ok := r.doc.Images[run.ImageID]
 			if !ok {
+				// Unsupported media (EMF/WMF/etc.) or unresolved rId. If
+				// the docx declared a w:extent (ImageWidthPt/HeightPt),
+				// emit a sized outline box so the layout reflects the
+				// real estate the original image occupied. Falls back
+				// to a text placeholder when no extent is known.
+				label, hasLabel := r.doc.UnsupportedMedia[run.ImageID]
+				if !hasLabel {
+					label = "image"
+				}
+				if run.ImageWidthPt > 0 && run.ImageHeightPt > 0 {
+					w := run.ImageWidthPt
+					h := run.ImageHeightPt
+					if w > r.contentW {
+						scale := r.contentW / w
+						w *= scale
+						h *= scale
+					}
+					shape := &docx.VMLShape{
+						Kind:           "rect",
+						WidthPt:        w,
+						HeightPt:       h,
+						StrokeColor:    "888888",
+						StrokeWeightPt: 0.5,
+						TextBox:        "[" + label + "]",
+					}
+					out = append(out, atom{
+						kind:   atomVMLShape,
+						width:  w,
+						height: h,
+						shape:  shape,
+						props:  run.Props,
+					})
+					continue
+				}
+				if run.AltText != "" {
+					stub := run
+					stub.ImageID = ""
+					stub.AltText = ""
+					stub.Text = "[" + run.AltText + "]"
+					out = append(out, r.runsToAtoms([]docx.Run{stub})...)
+					continue
+				}
+				if hasLabel {
+					placeholder := "[" + label + " image]"
+					stub := run
+					stub.ImageID = ""
+					stub.Text = placeholder
+					subOut := r.runsToAtoms([]docx.Run{stub})
+					out = append(out, subOut...)
+				}
 				continue
 			}
 			cropped := run.CropTopPct > 0 || run.CropBottomPct > 0 || run.CropLeftPct > 0 || run.CropRightPct > 0
+			hasEffects := len(run.ImageEffects) > 0
 			imgID := run.ImageID
-			if cropped {
-				img = cropImage(img, run.CropTopPct, run.CropBottomPct, run.CropLeftPct, run.CropRightPct)
+			if cropped || hasEffects {
+				if cropped {
+					img = cropImage(img, run.CropTopPct, run.CropBottomPct, run.CropLeftPct, run.CropRightPct)
+				}
+				if hasEffects {
+					img = applyImageEffects(img, run.ImageEffects)
+				}
 				if r.croppedCache == nil {
 					r.croppedCache = map[string]image.Image{}
 				}
-				imgID = run.ImageID + ":crop"
+				imgID = run.ImageID + ":fx"
 				r.croppedCache[imgID] = img
 			}
 			var w, h float64
@@ -183,15 +321,18 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				w, h = r.fitImage(img)
 			}
 			out = append(out, atom{
-				kind:         atomImage,
-				imageID:      imgID,
-				width:        w,
-				height:       h,
-				props:        run.Props,
-				linkRID:      run.LinkURL,
-				linkAnchor:   run.LinkAnchor,
-				anchored:     run.ImageAnchored,
-				anchorAlignH: run.AnchorAlignH,
+				kind:            atomImage,
+				imageID:         imgID,
+				width:           w,
+				height:          h,
+				props:           run.Props,
+				linkRID:         run.LinkURL,
+				linkAnchor:      run.LinkAnchor,
+				anchored:        run.ImageAnchored,
+				anchorAlignH:    run.AnchorAlignH,
+				anchorWrap:      run.AnchorWrap,
+				anchorOffsetXPt: run.AnchorOffsetXPt,
+				anchorOffsetYPt: run.AnchorOffsetYPt,
 			})
 			continue
 		}
@@ -202,6 +343,24 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				out = append(out, atom{kind: atomBreak, props: run.Props})
 			}
 			continue
+		}
+		if run.Math != nil {
+			fs := run.Props.FontSize
+			if fs == 0 {
+				fs = r.opts.DefaultFontSize
+			}
+			_ = r.applyRunFont(run.Props)
+			box := r.buildMathBox(run.Math, fs)
+			if box.w > 0 {
+				out = append(out, atom{
+					kind:   atomMath,
+					props:  run.Props,
+					width:  box.w,
+					height: box.height(),
+					math:   box,
+				})
+				continue
+			}
 		}
 		if run.Text == "" {
 			continue
@@ -345,6 +504,14 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		// the hanging outdent; later lines use the paragraph's normal margin.
 		x := r.marL - hang
 		effW := r.contentW + hang
+		// w:wrap="square" / "tight" with a side anchor: if a floating
+		// image is still active vertically, shift this line's left edge
+		// past the image (when image is on the left) or shrink the
+		// right edge (when image is on the right). Expired bands clear
+		// automatically the first time the cursor drops below them.
+		if x0, w0, ok := r.lineBandAdjust(r.cursorY, x, effW); ok {
+			x, effW = x0, w0
+		}
 		extraSpace := 0.0
 		switch align {
 		case docx.AlignCenter:
@@ -368,6 +535,11 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		hang = 0
 
 		baseline := r.cursorY + lineMaxH*0.8
+
+		// Bar tab stops paint a vertical rule at their absolute X across
+		// every line of the paragraph. They are decorative (the cursor
+		// doesn't advance to them — nextTabAfterWithAlign skips bars).
+		r.drawBarTabsForLine(x, r.cursorY, lineMaxH)
 
 		if r.pendingMarker != nil {
 			pm := r.pendingMarker
@@ -508,6 +680,9 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				r.pdf.SetX(cx)
 				r.pdf.SetY(baseline - r.opts.DefaultFontSize*0.8)
 				r.pdf.SetAnchor(a.text)
+				if r.fields.bookmarkPages != nil {
+					r.fields.bookmarkPages[a.text] = r.pdf.GetNumberOfPages()
+				}
 			case atomImage:
 				var img image.Image
 				if strings.Contains(a.imageID, ":crop") {
@@ -543,6 +718,16 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 				} else {
 					cx += a.width
 				}
+			case atomVMLShape:
+				if a.shape != nil {
+					drawVMLShape(r, a.shape, cx, r.cursorY, a.width, a.height)
+				}
+				cx += a.width
+			case atomMath:
+				if a.math.draw != nil {
+					a.math.draw(r, cx, baseline)
+				}
+				cx += a.width
 			}
 		}
 
@@ -568,11 +753,59 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			r.newPage()
 			continue
 		}
+		// Anchored image/shape with text-flow wrap. Three modes:
+		//   * none / behind / through: image is drawn at its anchored
+		//     position but does NOT participate in flow — surrounding
+		//     text continues at the same baseline as if the image weren't
+		//     there.
+		//   * square / tight + anchor on left/right: draw the image to
+		//     the side immediately, then let surrounding text continue
+		//     to flow beside it on the opposite side until the cursor
+		//     drops past the image's bottom (real wrap behavior).
+		//   * topAndBottom OR square/tight without a side anchor: take
+		//     the full line height for the image so following text
+		//     stacks below it (the legacy behavior, still right for
+		//     centered or "auto" positioned drawings).
+		if (a.kind == atomImage || a.kind == atomVMLShape) && a.anchored &&
+			(a.anchorWrap == "" || a.anchorWrap == "none" || a.anchorWrap == "behind" || a.anchorWrap == "through") {
+			r.drawFloatingShapeBehind(&a)
+			continue
+		}
+		if (a.kind == atomImage || a.kind == atomVMLShape) && a.anchored &&
+			(a.anchorWrap == "square" || a.anchorWrap == "tight") &&
+			(a.anchorAlignH == "left" || a.anchorAlignH == "right" ||
+				a.anchorAlignH == "inside" || a.anchorAlignH == "outside") {
+			r.drawFloatingShapeWithWrap(&a)
+			continue
+		}
+		if (a.kind == atomImage || a.kind == atomVMLShape) && a.anchored &&
+			(a.anchorWrap == "topAndBottom" || a.anchorWrap == "square" || a.anchorWrap == "tight") {
+			if len(line) > 0 {
+				if err := flush(false); err != nil {
+					return err
+				}
+			}
+			// Force the image's full height to be reserved.
+			lineMaxH = a.height
+			line = append(line, a)
+			lineW = a.width
+			if err := flush(false); err != nil {
+				return err
+			}
+			continue
+		}
 		h := atomHeight(a, r.opts.DefaultFontSize)
 		// First line gets hang extra width; subsequent lines use r.contentW.
 		// hang is zeroed inside flush() so this naturally tightens after the
 		// first wrap.
 		effW := r.contentW + hang
+		// When a floating image's wrap band is still active vertically,
+		// the actual available width is reduced — must agree with the
+		// adjustment flush() applies so wrap decisions and the painted
+		// line use the same metric.
+		if _, bw, ok := r.lineBandAdjust(r.cursorY, r.marL-hang, effW); ok {
+			effW = bw
+		}
 		// Over-wide word: a single word atom wider than the line's
 		// effective width can't be wrapped by the normal "atom-vs-atom"
 		// break logic. Try giving it a fresh line first — if it still
@@ -615,6 +848,42 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			}
 		}
 		if lineW+a.width > effW && len(line) > 0 {
+			// Kinsoku (East Asian line-break): when the atom that
+			// would start the next line is a "no-start" punctuation
+			// character (close-bracket, full-stop, comma, etc.),
+			// keep it on the current line — Word's
+			// w:overflowPunct=true / w:kinsoku=true semantics: the
+			// punctuation is allowed to overhang the right margin
+			// rather than orphan onto a fresh line.
+			if r.paragraphKinsoku && r.paragraphOverflowPunct && isKinsokuNoStart(a) {
+				line = append(line, a)
+				lineW += a.width
+				if h > lineMaxH {
+					lineMaxH = h
+				}
+				continue
+			}
+			// Symmetric rule: when the LAST atom on the current line
+			// is a "no-end" opener like "（「『", peel it off and let
+			// it start the next line with its trailing content.
+			if r.paragraphKinsoku && len(line) > 0 && isKinsokuNoEnd(line[len(line)-1]) {
+				orphan := line[len(line)-1]
+				line = line[:len(line)-1]
+				lineW -= orphan.width
+				if len(line) > 0 && line[len(line)-1].kind == atomSpace {
+					lineW -= line[len(line)-1].width
+					line = line[:len(line)-1]
+				}
+				if err := flush(false); err != nil {
+					return err
+				}
+				line = append(line, orphan, a)
+				lineW = orphan.width + a.width
+				if h > lineMaxH {
+					lineMaxH = h
+				}
+				continue
+			}
 			if len(line) > 0 && line[len(line)-1].kind == atomSpace {
 				lineW -= line[len(line)-1].width
 				line = line[:len(line)-1]
@@ -633,6 +902,48 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 		}
 	}
 	return flush(true)
+}
+
+// isKinsokuNoStart reports whether the atom's leading rune is a CJK
+// punctuation character that must not appear at the START of a line.
+// The list covers the most common entries from the JIS X 4051 strict
+// no-start set: Japanese closing punctuation, Chinese fullwidth
+// punctuation, and the standalone marker glyphs Word emits.
+func isKinsokuNoStart(a atom) bool {
+	if a.kind != atomWord || a.text == "" {
+		return false
+	}
+	r := []rune(a.text)[0]
+	switch r {
+	case '、', '。', '，', '．', '：', '；', '！', '？',
+		'）', '］', '｝', '〉', '》', '」', '』', '】', '〕', '〗', '〙', '〛',
+		'…', '‥', '‼', '⁇', '⁈', '⁉',
+		'゠', '〜', '゛', '゜', 'ー', 'ヽ', 'ヾ', 'ゝ', 'ゞ',
+		'々', '〻', '・',
+		'%', '％', '‰', '°', '′', '″', '℃',
+		',', '.', ':', ';', '!', '?', ')', ']', '}':
+		return true
+	}
+	return false
+}
+
+// isKinsokuNoEnd reports whether the atom's leading rune is a CJK
+// opening punctuation character that must not END a line. When such a
+// character lands at the end of a line, the renderer pulls it down to
+// the start of the next line with its content.
+func isKinsokuNoEnd(a atom) bool {
+	if a.kind != atomWord || a.text == "" {
+		return false
+	}
+	r := []rune(a.text)[0]
+	switch r {
+	case '（', '［', '｛', '〈', '《', '「', '『', '【', '〔', '〖', '〘', '〚',
+		'‘', '“', '〝',
+		'$', '＄', '￥', '￡', '￦', '€',
+		'(', '[', '{':
+		return true
+	}
+	return false
 }
 
 // splitWordAtomByRune breaks a word atom into one atom per rune, each
@@ -660,9 +971,141 @@ func (r *renderer) splitWordAtomByRune(a atom) []atom {
 	return out
 }
 
+// drawFloatingShapeWithWrap paints a side-anchored image / shape and
+// sets the active wrap band so subsequent text lines flow beside it.
+// The shape is drawn at the current cursor y; the cursor is NOT
+// advanced. When the band already exists from a prior shape, the new
+// shape stacks below the previous one — preserves source document order.
+func (r *renderer) drawFloatingShapeWithWrap(a *atom) {
+	if a.width <= 0 || a.height <= 0 {
+		return
+	}
+	side := "left"
+	switch a.anchorAlignH {
+	case "right", "outside":
+		side = "right"
+	}
+	// If a band is already active, start this shape below the previous
+	// one so they don't overlap visually.
+	shapeTop := r.cursorY
+	if r.floatBand != nil && r.cursorY < r.floatBand.bottomY {
+		shapeTop = r.floatBand.bottomY
+	}
+	var imgX float64
+	if side == "right" {
+		imgX = r.marL + r.contentW - a.width
+	} else {
+		imgX = r.marL
+	}
+	// AnchorOffsetXPt is applied as a small lateral nudge from the
+	// snapped left/right edge. Word writes this even when an alignment
+	// is specified (especially in templates exported from web editors)
+	// so honoring it keeps captions/portraits aligned with the source.
+	imgX += a.anchorOffsetXPt
+	if a.kind == atomImage {
+		var img image.Image
+		if strings.Contains(a.imageID, ":crop") {
+			img = r.croppedCache[a.imageID]
+		} else {
+			img = r.doc.Images[a.imageID]
+		}
+		if img != nil {
+			_ = r.drawImage(img, imgX, shapeTop, a.width, a.height)
+		}
+	} else if a.shape != nil {
+		drawVMLShape(r, a.shape, imgX, shapeTop, a.width, a.height)
+	}
+	r.floatBand = &floatWrapBand{
+		leftX:   imgX,
+		rightX:  imgX + a.width,
+		bottomY: shapeTop + a.height,
+		side:    side,
+		gapPt:   6,
+	}
+}
+
+// drawFloatingShapeBehind paints a wp:anchor image whose wrap is
+// none/behind/through — text doesn't yield to it. The image is placed
+// at marL+anchorOffsetX (or aligned per anchorAlignH) and cursorY+
+// anchorOffsetY. The inline cursor and lineMaxH are NOT advanced.
+func (r *renderer) drawFloatingShapeBehind(a *atom) {
+	if a.width <= 0 || a.height <= 0 {
+		return
+	}
+	imgX := r.marL + a.anchorOffsetXPt
+	switch a.anchorAlignH {
+	case "right", "outside":
+		imgX = r.marL + r.contentW - a.width
+	case "center":
+		imgX = r.marL + (r.contentW-a.width)/2
+	case "left", "inside":
+		imgX = r.marL
+	}
+	imgY := r.cursorY + a.anchorOffsetYPt
+	if a.kind == atomImage {
+		var img image.Image
+		if strings.Contains(a.imageID, ":crop") {
+			img = r.croppedCache[a.imageID]
+		} else {
+			img = r.doc.Images[a.imageID]
+		}
+		if img != nil {
+			_ = r.drawImage(img, imgX, imgY, a.width, a.height)
+		}
+	} else if a.shape != nil {
+		drawVMLShape(r, a.shape, imgX, imgY, a.width, a.height)
+	}
+}
+
+// lineBandAdjust returns the (x, width, true) constraints for a line
+// whose top is at y. Returns (_, _, false) when no band is active or
+// the line falls below the band. A side-effect-free read; expiration
+// is detected and the field cleared on the next paragraph boundary
+// (see drawParagraph) so we don't mutate state during line layout.
+func (r *renderer) lineBandAdjust(y, baseX, baseW float64) (float64, float64, bool) {
+	if r.floatBand == nil {
+		return 0, 0, false
+	}
+	if y >= r.floatBand.bottomY {
+		return 0, 0, false
+	}
+	gap := r.floatBand.gapPt
+	if r.floatBand.side == "left" {
+		newX := r.floatBand.rightX + gap
+		if newX > baseX {
+			delta := newX - baseX
+			if delta >= baseW {
+				return baseX, 0, true
+			}
+			return newX, baseW - delta, true
+		}
+		return baseX, baseW, true
+	}
+	// right side
+	limit := r.floatBand.leftX - gap
+	rightEdge := baseX + baseW
+	if rightEdge > limit {
+		newW := limit - baseX
+		if newW < 0 {
+			newW = 0
+		}
+		return baseX, newW, true
+	}
+	return baseX, baseW, true
+}
+
+// clearExpiredFloatBand drops the active wrap band when the cursor has
+// passed its bottomY. Called at safe boundaries (paragraph start, page
+// break) so the field doesn't churn during line layout.
+func (r *renderer) clearExpiredFloatBand() {
+	if r.floatBand != nil && r.cursorY >= r.floatBand.bottomY {
+		r.floatBand = nil
+	}
+}
+
 func atomHeight(a atom, defaultSize float64) float64 {
 	switch a.kind {
-	case atomImage:
+	case atomImage, atomVMLShape, atomMath:
 		return a.height
 	case atomWord, atomSpace, atomTab:
 		sz := a.props.FontSize
@@ -680,6 +1123,34 @@ func fontAscent(p docx.RunProps, defaultSize float64) float64 {
 		sz = defaultSize
 	}
 	return sz * 0.8
+}
+
+// applyComplexScriptProps merges Word's complex-script alternatives into
+// the regular bold/italic/size fields when the run is part of an RTL or
+// CS-tagged run. Word stores Latin and complex-script formatting on
+// separate attrs (w:b vs w:bCs, w:i vs w:iCs, w:sz vs w:szCs) so a doc
+// can render the same characters differently depending on script
+// resolution; mirroring that here lets the renderer pick the right
+// glyph weight without leaking script-awareness deeper into the pipeline.
+//
+// We trigger on either p.CS (explicit complex-script tag) or paraBidi
+// (paragraph-level RTL) so single-character RTL atoms inside a Bidi
+// paragraph get the CS treatment even when the run lacks an explicit
+// w:cs marker — matching docx4j's "Bidi promotes to CS" behavior.
+func applyComplexScriptProps(p docx.RunProps, paraBidi bool) docx.RunProps {
+	if !p.CS && !paraBidi {
+		return p
+	}
+	if p.BCs {
+		p.Bold = true
+	}
+	if p.ICs {
+		p.Italic = true
+	}
+	if p.SzCs > 0 {
+		p.FontSize = p.SzCs
+	}
+	return p
 }
 
 // allRTL reports whether every rune in s belongs to a right-to-left

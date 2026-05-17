@@ -43,6 +43,7 @@ func main() {
 	workers := flag.Int("workers", 1, "in batch mode, parallel worker count (default 1)")
 	lenient := flag.Bool("lenient", false, "skip broken paragraphs/tables and log instead of failing")
 	author := flag.String("author", "", "override AUTHOR field / PDF Info Author")
+	showRevisions := flag.Bool("show-revisions", false, "render tracked changes (ins underlined, del struck-through, per-author colors) instead of silently accepting them")
 	verbose := flag.Bool("v", false, "verbose logging")
 	flag.Parse()
 
@@ -64,6 +65,7 @@ func main() {
 		Verbose:         *verbose,
 		Lenient:         *lenient,
 		Author:          *author,
+		ShowRevisions:   *showRevisions,
 	}
 
 	// Streaming mode: -in - and/or -out -.

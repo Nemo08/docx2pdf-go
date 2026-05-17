@@ -37,6 +37,11 @@ type Document struct {
 	// the data graphic but we surface titles, axis labels, and data
 	// labels so the prose around the chart still makes sense.
 	Charts map[string]string
+	// ChartsData captures the parsed series + categories for chart parts
+	// where the renderer can produce a real graphic (bar / column / pie /
+	// line). When the chart type isn't recognized the entry is omitted and
+	// the renderer falls back to the flat text in Charts.
+	ChartsData map[string]ChartData
 	// Diagrams maps the dgm:relIds "r:dm" relationship id → flattened
 	// text extracted from the SmartArt data part
 	// (word/diagrams/dataN.xml). Each diagram surfaces as a list of
@@ -44,6 +49,11 @@ type Document struct {
 	// survives in the PDF text stream even though we don't render the
 	// graphical shapes.
 	Diagrams map[string]string
+	// DiagramShapes holds the parsed visual shape tree for each SmartArt
+	// diagram, keyed by the data part's relationship id (same key as
+	// Diagrams). When set, the renderer paints the actual shape tree;
+	// otherwise it falls back to the labeled-box placeholder.
+	DiagramShapes map[string]*VMLShape
 	// Theme is the parsed contents of word/theme/theme1.xml — color scheme +
 	// font scheme — used to resolve w:themeColor / rFonts w:asciiTheme refs.
 	Theme Theme
@@ -65,6 +75,116 @@ type Document struct {
 	FootnoteSeparators map[string][]Block
 	// EndnoteSeparators is the endnote equivalent.
 	EndnoteSeparators map[string][]Block
+	// DocVars are document variables from settings.xml w:docVars. Used by
+	// the DOCVARIABLE field code.
+	DocVars map[string]string
+	// CustomProperties are extra metadata properties from docProps/custom.xml.
+	CustomProperties map[string]string
+	// AltChunks maps a relationship id to text extracted from an
+	// AlternativeFormatInputPart (HTML / RTF / text).
+	AltChunks map[string][]Block
+	// Bibliography is the parsed b:Sources from customXml/itemN.xml.
+	Bibliography map[string]BibSource
+	// CustomXMLRoots maps a custom-xml part name to its root element snapshot
+	// — used to evaluate w:dataBinding XPaths inside SDTs.
+	CustomXMLRoots []CustomXMLPart
+	// OpenDoPEXPaths is the id→xpath table parsed from any customXml part
+	// that follows the OpenDoPE schema (<od:xpaths> root). Empty when the
+	// document doesn't use OpenDoPE bindings.
+	OpenDoPEXPaths map[string]string
+	// MailMerge is non-empty when settings.xml declared <w:mailMerge>.
+	MailMerge string
+	// HasGlossary is true when the package contains word/glossary/document.xml.
+	HasGlossary bool
+	// Glossary maps a docPart's gallery/name (the keys an AUTOTEXT or
+	// GLOSSARY field references) to the plain-text run sequence carried
+	// by its <w:docPart>/<w:docPartBody>. Word's docParts can be rich
+	// (paragraphs, tables, images); we keep just the text payload so
+	// fields can expand. Empty when the package has no glossary.
+	Glossary map[string]string
+	// EmbeddedFonts holds deobfuscated TTF byte streams for fonts the
+	// package embeds via word/fontTable.xml + w:embedRegular / Bold /
+	// Italic / BoldItalic.
+	EmbeddedFonts map[string]EmbeddedFont
+	// PeopleByID maps the durable id from word/people.xml to the
+	// author's display name + email.
+	PeopleByID map[string]Person
+	// OLEEmbeds maps an OLEObject relationship id to its decoded
+	// content. Only Excel (Excel.Sheet.*) packages are currently
+	// extracted; other ProgIDs leave the entry absent and the renderer
+	// falls back to the preview image.
+	OLEEmbeds map[string]ExcelEmbed
+	// CommentsExtended holds the threaded / "marked done" state of each
+	// w:id, parsed from word/commentsExtended.xml.
+	CommentsExtended map[string]CommentExtended
+	// UnsupportedMedia maps a relationship id whose target file is a
+	// media format the renderer cannot draw (EMF, WMF) to its format
+	// label ("EMF", "WMF").
+	UnsupportedMedia map[string]string
+	// CommentMeta indexes w:author / w:date / w:initials per comment id
+	// from word/comments.xml.
+	CommentMeta map[string]CommentMeta
+}
+
+// BibSource is one parsed entry from a bibliography custom XML store.
+type BibSource struct {
+	Tag         string
+	SourceType  string
+	Title       string
+	Authors     []string
+	Year        string
+	Publisher   string
+	City        string
+	JournalName string
+	Pages       string
+	URL         string
+}
+
+// CustomXMLPart is one custom-xml store referenced from customXml/itemN.xml.
+type CustomXMLPart struct {
+	PartName string
+	Data     []byte
+	// StoreItemID is the GUID pulled from the companion
+	// customXml/itemPropsN.xml (<ds:datastoreItem ds:itemID="{…}">).
+	// SDTs reference a store explicitly via <w:storeItemID>; honoring
+	// this lets us pick the right store when a document carries multiple
+	// data sources with overlapping element names.
+	StoreItemID string
+}
+
+// EmbeddedFont carries the deobfuscated TTF/OTF binary for each of the
+// four font-style variants Word stores.
+type EmbeddedFont struct {
+	Name       string
+	AltName    string
+	Regular    []byte
+	Bold       []byte
+	Italic     []byte
+	BoldItalic []byte
+}
+
+// Person is one author entry from word/people.xml.
+type Person struct {
+	ID         string
+	Name       string
+	ProviderID string
+	Email      string
+}
+
+// CommentExtended carries word/commentsExtended.xml metadata.
+type CommentExtended struct {
+	ParaID       string
+	ParentParaID string
+	Done         bool
+}
+
+// CommentMeta is the cluster of attributes Word stores on each w:comment
+// element. The body content is in Document.Comments.
+type CommentMeta struct {
+	Author   string
+	Date     string
+	Initials string
+	ParaID   string
 }
 
 // Theme holds the bits of theme1.xml we read.
@@ -119,6 +239,72 @@ type Settings struct {
 	// switch for w:background (page color). When absent, Word does NOT
 	// paint the background even if a color is defined.
 	DisplayBackgroundShape bool
+	// DocumentProtection captures w:documentProtection. Zero-value means
+	// no protection. Edit is one of "readOnly", "comments", "trackedChanges",
+	// "forms", "none". Enforcement is true when w:enforcement="1" and the
+	// document protection is actually active.
+	DocumentProtection DocProtection
+	// WriteProtection mirrors w:writeProtection (separate element); when
+	// Enforcement is true the document is meant to open read-only unless
+	// the password is supplied.
+	WriteProtection WriteProtection
+	// AutoHyphenation is w:autoHyphenation — when true, Word automatically
+	// hyphenates long words at line breaks. The renderer treats this as
+	// advisory metadata only (it currently does not perform hyphenation).
+	AutoHyphenation bool
+	// DoNotHyphenateCaps is w:doNotHyphenateCaps — suppress hyphenation
+	// for all-caps words even when AutoHyphenation is on.
+	DoNotHyphenateCaps bool
+	// HyphenationZoneTwips is the maximum allowed line-end whitespace in
+	// twips before Word inserts a hyphen.
+	HyphenationZoneTwips int
+	// ConsecutiveHyphenLimit caps the number of consecutive hyphenated
+	// lines (0 = no limit).
+	ConsecutiveHyphenLimit int
+	// CharacterSpacingControl is w:characterSpacingControl — one of "",
+	// "doNotCompress", "compressPunctuation", "compressPunctuationAndJapaneseKana".
+	// Drives Word's CJK punctuation compression rules.
+	CharacterSpacingControl string
+	// Compat captures the subset of w:compat options we surface so callers
+	// can branch on Word version differences.
+	Compat CompatOptions
+}
+
+// CompatOptions mirrors the most consequential w:compat children. Each
+// flag is *bool so callers can tell "absent" (defer to renderer default)
+// from "explicitly false". We surface only options that affect rendering;
+// the long tail of revisionable knobs (printerMetrics, etc.) is ignored.
+type CompatOptions struct {
+	DoNotExpandShiftReturn       *bool
+	UseSingleBorderForContiguousCells *bool
+	GrowAutofit                  *bool
+	NoLeading                    *bool
+	SpacingInWholePoints         *bool
+	BalanceSingleByteDoubleByteWidth *bool
+	DoNotUseEastAsianBreakRules  *bool
+	SuppressTopSpacing           *bool
+	UlTrailSpace                 *bool
+	DoNotLeaveBackslashAlone     *bool
+	UseFELayout                  *bool
+}
+
+// DocProtection captures the bits of w:documentProtection we surface.
+// Hash / salt fields are deliberately omitted — we don't enforce, just
+// record the policy.
+type DocProtection struct {
+	Edit             string
+	Enforcement      bool
+	FormatLockdown   bool
+	AlgorithmName    string
+	CryptProviderTyp string
+}
+
+// WriteProtection mirrors w:writeProtection.
+type WriteProtection struct {
+	Recommended      bool
+	Enforcement      bool
+	AlgorithmName    string
+	CryptProviderTyp string
 }
 
 // Properties mirrors a slice of word/docProps/core.xml + app.xml. Word/Office
@@ -133,6 +319,18 @@ type Properties struct {
 	Words      int
 	Characters int
 	Lines      int
+	// TotalTime is the total document editing time in minutes — surfaced by
+	// the EDITTIME field. Parsed from docProps/app.xml `<TotalTime>`.
+	TotalTime int
+	// Keywords and Comments come from docProps/core.xml.
+	Keywords string
+	Comments string
+	// CreateDate / ModifyDate / PrintDate are RFC-3339 timestamps; surfaced
+	// by the matching CREATEDATE / SAVEDATE / PRINTDATE fields. Empty when
+	// the doc didn't record them.
+	CreateDate string
+	ModifyDate string
+	PrintDate  string
 }
 
 // ParaDefaults seeds every paragraph before its own pPr is applied. Modern
@@ -158,6 +356,13 @@ type PageNumberType struct {
 // PageBorders encodes w:pgBorders — colored frame around the page.
 type PageBorders struct {
 	Top, Bottom, Left, Right BorderEdge
+	// OffsetFromText is w:offsetFrom — "page" (default) measures the inset
+	// from the page edge; "text" measures it from the text edge (margin).
+	OffsetFromText bool
+	// OffsetTopPt / Bottom / Left / Right encode w:pgBorders edge offsets
+	// (Word stores in points directly here, NOT twips). Default 24pt when
+	// unset, matching Word's typical 24pt page border inset.
+	OffsetTopPt, OffsetBottomPt, OffsetLeftPt, OffsetRightPt float64
 }
 
 // FrameInfo encodes w:framePr's positioning attributes for a paragraph
@@ -220,6 +425,17 @@ type Section struct {
 	LineNumbering     LineNumbering // w:lnNumType
 	Columns           int           // w:cols w:num (1 = no columns)
 	ColumnSpaceTwips  int           // w:cols w:space between columns
+	// ColumnSeparator is w:cols w:sep — when true, the renderer draws a
+	// thin vertical rule between adjacent columns.
+	ColumnSeparator bool
+	// ColumnEqualWidth mirrors w:cols w:equalWidth. When false, ColumnSpecs
+	// carries per-column widths; otherwise the renderer derives them
+	// uniformly from page width.
+	ColumnEqualWidth bool
+	// ColumnSpecs lists per-column widths + trailing space (the space
+	// between this column and the next) in twips. Empty when equalWidth
+	// is true.
+	ColumnSpecs []ColumnSpec
 	// VAlign is w:vAlign — vertical page alignment for the section:
 	// "" (default top), "center", "both" (justify), "bottom". Cover pages
 	// often set this to "center" for the title.
@@ -237,6 +453,17 @@ type Section struct {
 	// this section: position, numbering format, restart policy, start at N.
 	FootnotePr *NoteConfig
 	EndnotePr  *NoteConfig
+	// PrChange records w:sectPrChange — tracked-change of section
+	// properties (page size/margins/columns adjusted under revision).
+	PrChange *PrChange
+}
+
+// ColumnSpec is one column of an unequal-width multi-column section
+// (w:col inside w:cols). WidthTwips is the column body width; SpaceTwips
+// is the gap to the next column (zero on the last).
+type ColumnSpec struct {
+	WidthTwips int
+	SpaceTwips int
 }
 
 // DocGrid captures w:docGrid's three knobs.
@@ -266,6 +493,10 @@ type ParagraphStyle struct {
 	SpacingBefore float64
 	SpacingAfter  float64
 	LineHeight    LineHeight
+	// LinkedCharStyle is w:link — when a paragraph style is "linked" to a
+	// character style, applying the paragraph style should auto-apply the
+	// linked character style to every run that doesn't otherwise override.
+	LinkedCharStyle string
 }
 
 // Block is either a Paragraph or a Table.
@@ -354,6 +585,23 @@ type Paragraph struct {
 	// endsSection is set when this paragraph's pPr contained an inline sectPr.
 	// Internal-only: the parser uses it to know when to close out a section.
 	endsSection bool
+
+	// PrChange records a tracked change of paragraph or section properties.
+	// Set when w:pPrChange or w:sectPrChange appears inside this paragraph's
+	// pPr; the renderer paints a left-margin change bar when ShowRevisions
+	// is on.
+	PrChange *PrChange
+}
+
+// PrChange records that a paragraph / run / section / table / row / cell
+// had its properties changed by a tracked-revision author. Renderer uses
+// this to paint a change bar in the margin or attach a hover note in the
+// PDF outline. Author / Date / ID match the corresponding w:*Change attrs.
+type PrChange struct {
+	Kind   string // "pPr" / "rPr" / "sectPr" / "tblPr" / "tcPr" / "trPr" / "tblGrid"
+	ID     string
+	Author string
+	Date   string
 }
 
 // TabStop is one entry of a paragraph's w:tabs definition.
@@ -408,6 +656,9 @@ type Run struct {
 	// Image source-rect crop in PERCENT (a:srcRect attrs are 1/1000 of percent
 	// from each edge). E.g. CropTop=10000 = 10%. Zero = no crop on that side.
 	CropTopPct, CropBottomPct, CropLeftPct, CropRightPct float64
+	// ImageEffects, when non-nil, lists DrawingML pixel-effect filters that
+	// should be applied to the image before placement. See ImageEffect.
+	ImageEffects []ImageEffect
 	// ImageAnchored is true if the run comes from a wp:anchor (floating
 	// image) rather than wp:inline. Renderer still draws inline as a
 	// best-effort fallback; AnchorAlignH/V capture the requested anchor
@@ -440,6 +691,250 @@ type Run struct {
 	FieldSep   bool // w:fldChar w:fldCharType="separate" — code → result boundary
 	FieldEnd   bool
 	InstrText  string
+
+	// InkPlaceholder marks a w14:ink run whose glyph stream we couldn't
+	// rasterize.
+	InkPlaceholder bool
+
+	// Math, when non-nil, carries the structural OMML tree for this run.
+	// The renderer prefers it over Text and lays out a 2D math expression
+	// (fraction bars, sized brackets, radicals with vinculum, etc.).
+	// Text is set in parallel as the searchable fallback.
+	Math *MathNode
+
+	// FormField, when non-nil, marks this run as a legacy form field
+	// (w:fldChar w:fldCharType="begin" wrapping a w:ffData). The renderer
+	// turns the form's default/checked/selected state into visible glyph
+	// content when Word didn't cache a result region.
+	FormField *FormFieldInfo
+
+	// AltText, when non-empty, supplies an accessibility description for
+	// this run's image / shape (wp:docPr w:descr or w:title). Surfaced into
+	// PDF /Alt entries when the underlying writer supports them.
+	AltText string
+
+	// Ruby, when non-nil, decorates this run with an interlinear ruby
+	// annotation drawn above the base text.
+	Ruby *RubyInfo
+
+	// VMLShape, when non-nil, describes a legacy VML shape (v:rect /
+	// v:line / v:oval / v:roundrect) that should render as a geometric
+	// primitive in place of an image.
+	VMLShape *VMLShape
+
+	// RevisionType records that this run is inside a tracked-change
+	// wrapper: "ins", "del", "moveTo", "moveFrom", or "" (none). The
+	// renderer either drops del/moveFrom runs (accept mode, the default)
+	// or decorates them visually (show-revisions mode). Nested wrappers
+	// keep the innermost tag so display reflects the final intent.
+	RevisionType string
+	// RevisionAuthor is the w:author attribute on the parent ins/del
+	// wrapper. Surfaced for accessibility and for show-revisions color
+	// derivation.
+	RevisionAuthor string
+	// PrChange records w:rPrChange — tracked-change of run properties
+	// (a run whose rPr was edited under revision). The renderer prints
+	// a change bar in the margin when ShowRevisions is on.
+	PrChange *PrChange
+}
+
+// RubyInfo decorates a run with interlinear ruby annotation.
+type RubyInfo struct {
+	Text     string
+	HpsRaise float64
+	Hps      float64
+	Align    string
+	LangAttr string
+}
+
+// ChartData is the renderable shape of a parsed chartN.xml part. We
+// only model the bits the renderer can paint: chart family, series, and
+// category labels. Stylistic flourishes (3D, gradients, glow effects)
+// are deliberately dropped.
+type ChartData struct {
+	// Kind is one of "bar", "column", "pie", "doughnut", "line", "scatter".
+	// Empty when the chart part used an unrecognized chart type — callers
+	// should fall back to the flat text in Document.Charts in that case.
+	Kind   string
+	Title  string
+	Series []ChartSeries
+	// Categories are the X-axis labels (or pie slice labels). May be
+	// shorter than series.Values; missing entries default to "1", "2", ...
+	Categories []string
+	// Grouping captures the c:grouping value: "clustered" (default for
+	// bar/column), "stacked", "percentStacked", or "standard"/"stacked"/
+	// "percentStacked" for area/line. Empty means clustered.
+	Grouping string
+}
+
+// ChartSeries is one plotted line / bar group / pie ring.
+type ChartSeries struct {
+	Name   string
+	Values []float64
+	// Color, when non-empty, is the explicit 6-hex series color from the
+	// chart part. Empty entries fall back to a palette picked by index.
+	Color string
+}
+
+// VMLShape captures the rendering knobs of a legacy VML primitive.
+type VMLShape struct {
+	Kind           string // "rect", "roundrect", "oval", "line", "polyline", "group", or a DrawingML prstGeom name
+	WidthPt        float64
+	HeightPt       float64
+	FillColor      string
+	StrokeColor    string
+	StrokeWeightPt float64
+	Points         string // for v:polyline
+	CornerArc      float64
+	TextBox        string
+	// TextBoxBlocks, when non-nil, holds the parsed paragraph/table tree
+	// from the shape's <w:txbxContent>. The renderer prefers this over
+	// TextBox when present so bold/italic/lists/nested-tables inside the
+	// text box survive into the PDF instead of being flattened to one line.
+	TextBoxBlocks []Block
+	// Chart, when non-nil, declares this shape is a chart placeholder
+	// the renderer should paint as a real bar/pie/line graphic. Set on
+	// shapes synthesized from a chart drawing reference (c:chart r:id).
+	Chart *ChartData
+	// Children, when non-empty, lists nested shapes whose coordinates are
+	// in the parent's local space (origin at parent's top-left). Used for
+	// v:group recursion.
+	Children []VMLShape
+	// OffsetXPt / OffsetYPt position a child shape within its parent
+	// group's coordinate space. Both default to 0. The renderer reads
+	// these on group children so SmartArt nodes / explicit dsp:sp
+	// shapes land where the source XML asked instead of getting
+	// auto-tiled.
+	OffsetXPt, OffsetYPt float64
+	// CoordSizeW / CoordSizeH define the "world" coordinate space of a
+	// group: child OffsetX/Y/Width/Height are interpreted as points in
+	// this world and projected into the group's bounding rect. Zero
+	// means "fall back to the group's own width/height", which gives
+	// 1:1 mapping for shapes synthesized with absolute coordinates.
+	CoordSizeW, CoordSizeH float64
+	// CustomPath, when non-empty, is a DrawingML <a:custGeom> path-list as
+	// a flat token list ("M 0 0 L 1 0 L 1 1 Z" style — m/l/c/q/z plus
+	// numeric tokens). Coordinates are in the shape's local 0..1 space.
+	CustomPath string
+	// GradientKind is "linear" / "radial" / "" (no gradient — fall back to
+	// FillColor). When set, GradientStops drives the gradient color ramp.
+	GradientKind string
+	// GradientAngle is the linear-gradient angle in DEGREES (0 = left→
+	// right, 90 = top→bottom, increasing clockwise). Unused for radial.
+	GradientAngle float64
+	GradientStops []GradientStop
+	// Shadow, when non-nil, adds an outer drop shadow drawn before the
+	// shape itself.
+	Shadow *ShadowEffect
+	// Pattern, when non-nil, names a DrawingML pattern preset (dkHorz /
+	// pct25 / wave / etc.) plus its fg/bg colors. The renderer paints a
+	// repeating tile inside the shape bounds before stroking the outline.
+	Pattern *PatternFill
+	// RotationDeg is the clockwise rotation in degrees applied around the
+	// shape's center at draw time. Sourced from a:xfrm rot (Word stores
+	// 60000ths of a degree there; the parser converts). 0 = no rotation.
+	RotationDeg float64
+	// FlipH / FlipV mirror the shape along its vertical / horizontal axis.
+	// gopdf has no native scale-with-sign primitive, so we approximate
+	// flipH+flipV as a 180° rotation (visually identical for symmetric
+	// rects/ovals) and flag-only flips as a rotate(±180) on the appropriate
+	// axis. Asymmetric shapes (polylines, custGeoms) won't survive this
+	// approximation cleanly, but the alternative is a custom CTM emit
+	// against the raw page stream which is outside our gopdf-only scope.
+	FlipH bool
+	FlipV bool
+	// InnerShadow / Glow / Reflection are best-effort approximations of
+	// the DrawingML a:innerShdw / a:glow / a:reflection effects. We
+	// stroke an inset thin line for inner shadow, paint a faint halo for
+	// glow, and draw a clipped mirrored copy at 60% opacity for
+	// reflection. Zero values mean "no effect of this kind".
+	InnerShadow *ShadowEffect
+	Glow        *GlowEffect
+	Reflection  *ReflectionEffect
+}
+
+// ImageEffect describes a per-pixel filter that lives under a:blip — the
+// renderer composites them onto the raster before placement. Kind is the
+// element name (alphaModFix / lum / biLevel / duotone / clrChange /
+// grayscl / blur). The remaining fields carry the operands; unused fields
+// are zero.
+type ImageEffect struct {
+	Kind string
+	// AmountPct is 0..100 — used by alphaModFix.Amount and lum's
+	// bright/contrast deltas (signed for those: -100..100).
+	Amount float64
+	// Bright / Contrast deltas (a:lum), 1/1000 of percent so we normalize
+	// to fraction. Range: roughly -1..1 each.
+	Bright   float64
+	Contrast float64
+	// Threshold for a:biLevel, 0..1 (default 0.5 when zero).
+	Threshold float64
+	// FgHex / BgHex carry duotone's two end-points or clrChange's from→to.
+	FgHex string
+	BgHex string
+	// BlurRadiusPx for a:blur — captured but the renderer typically maps
+	// this to a softer fade rather than a true gaussian.
+	BlurRadiusPx float64
+}
+
+// GlowEffect captures <a:glow> attributes.
+type GlowEffect struct {
+	RadiusPt float64
+	Color    string
+	Alpha    float64
+}
+
+// ReflectionEffect captures the <a:reflection> attributes the renderer
+// can approximate. StartA / EndA control opacity at the top / bottom of
+// the mirror; DistPt is the gap between shape and reflection; FadeDirDg
+// is the gradient angle (rarely deviates from 90°, i.e. straight down).
+type ReflectionEffect struct {
+	BlurPt    float64
+	Opacity   float64 // legacy single-opacity for older renderers
+	StartA    float64 // start alpha (0..1) — top edge
+	EndA      float64 // end alpha — bottom edge (typically 0)
+	DistPt    float64 // distance from shape
+	FadeDirDg float64 // gradient direction in degrees
+}
+
+// GradientStop is one entry of a DrawingML <a:gsLst> gradient.
+//
+//	Pos is the position along the gradient axis as a fraction in [0,1]
+//	(Word stores it as a number 0..100000 = 0%..100% which the parser
+//	converts).
+//	Color is the resolved 6-hex color at that position.
+//	Alpha is in [0,1] — 1.0 = fully opaque (default).
+type GradientStop struct {
+	Pos   float64
+	Color string
+	Alpha float64
+}
+
+// ShadowEffect captures <a:outerShdw> attributes.
+//
+//	OffsetXPt / OffsetYPt: shadow displacement in points (Y > 0 = below).
+//	BlurPt: blur radius approximated as additional stroked outline
+//	  thickness (the gopdf backend doesn't have a true blur primitive).
+//	Color: 6-hex shadow color (defaults to black).
+//	Alpha: 0..1 transparency (1 = opaque).
+type ShadowEffect struct {
+	OffsetXPt float64
+	OffsetYPt float64
+	BlurPt    float64
+	Color     string
+	Alpha     float64
+}
+
+// FormFieldInfo carries the parsed bits of w:ffData (legacy form fields).
+// All form types share this struct; Kind disambiguates: "text", "checkbox",
+// "dropdown".
+type FormFieldInfo struct {
+	Kind     string   // "text", "checkbox", "dropdown"
+	Default  string   // text default value
+	Checked  bool     // checkbox state
+	Choices  []string // dropdown options
+	Selected int      // dropdown selected index (0-based)
+	Name     string   // w:name — form field name
 }
 
 // RunProps captures character-level formatting we honor.
@@ -528,6 +1023,30 @@ type RunProps struct {
 	// TextBorder mirrors w:bdr (a border around the run's text — distinct
 	// from paragraph or table borders). Empty Style means "no border".
 	TextBorder BorderEdge
+	// W14Ligatures captures the requested OpenType ligature mode.
+	W14Ligatures    string
+	W14ShadowColor  string
+	W14OutlineColor string
+	// W14NumForm is "lining" (default) or "oldStyle" — selects between
+	// figure styles in OpenType fonts that ship both.
+	W14NumForm string
+	// W14NumSpacing is "default", "proportional" (variable-width digits),
+	// or "tabular" (fixed-width digits). Tabular is the better choice
+	// for tables/columns; proportional reads more naturally in prose.
+	W14NumSpacing string
+	// W14CntxtAlts enables contextual alternates ("true"/"false"/""=default).
+	W14CntxtAlts string
+
+	// EALayout is set when w:eastAsianLayout was present on this run.
+	EALayout *EALayoutInfo
+}
+
+// EALayoutInfo carries w:eastAsianLayout attributes.
+type EALayoutInfo struct {
+	Combine         bool
+	CombineBrackets string
+	Vert            bool
+	VertCompress    bool
 }
 
 // RunLang carries the language hints from w:lang.
@@ -591,6 +1110,14 @@ type Table struct {
 	// DefaultCellMargins captures w:tblCellMar — default margins applied
 	// to every cell unless that cell sets w:tcMar.
 	DefaultCellMargins CellMargins
+	// CellSpacingTwips is w:tblCellSpacing at the table level.
+	CellSpacingTwips int
+	// IndentTwips is w:tblInd — extra left indent applied to the entire
+	// table. Renderer shifts the table's starting X by this amount.
+	IndentTwips int
+	// PrChange records w:tblPrChange / w:tblGridChange — tracked-change
+	// of table properties / grid. Used for change-bar margin markers.
+	PrChange *PrChange
 }
 
 // CellMargins in points.
@@ -647,6 +1174,8 @@ type TableRow struct {
 	// CellSpacingTwips is w:tblCellSpacing — space between cells. Parsed
 	// but not rendered (we render with the standard zero-gap layout).
 	CellSpacingTwips int
+	// PrChange records w:trPrChange — tracked-change of row properties.
+	PrChange *PrChange
 }
 
 type TableCell struct {
@@ -690,6 +1219,21 @@ type TableCell struct {
 	// when zero. We only honor symmetric defaults; per-cell overrides take
 	// precedence.
 	MarginTopPt, MarginBottomPt, MarginLeftPt, MarginRightPt float64
+
+	// SuppressBottomBorder is set by the renderer's vMerge resolver when
+	// this cell's bottom edge falls inside a vertical-merge group (i.e.
+	// the row below has a VMerge="continue" cell in the same logical
+	// column). Drawing the bottom edge would print a horizontal divider
+	// through the merged region.
+	SuppressBottomBorder bool
+	// MergedHeightPt is set on a VMerge="restart" cell to the cumulative
+	// pixel height of every row in the merge group (itself plus every
+	// VMerge="continue" cell that follows in the same column). The
+	// renderer uses this for vAlign math so the content centers within
+	// the visual merged region instead of just the first row.
+	MergedHeightPt float64
+	// PrChange records w:tcPrChange — tracked-change of cell properties.
+	PrChange *PrChange
 }
 
 // Paragraphs returns the paragraph-typed blocks in document order — kept as
@@ -709,8 +1253,14 @@ func (c TableCell) Paragraphs() []Paragraph {
 // "no border on that edge" — table-level borders are propagated into
 // cells at parse time (see propagateTableBorders), so by the time the
 // renderer sees a cell every meaningful edge is filled in.
+//
+// TL2BR / TR2BL are diagonal lines drawn from corner to corner. Word uses
+// them to "cross out" header cells (e.g. the empty corner in a row-+col-
+// labeled matrix). They render alongside the rectangular edges; the
+// straight edges still take precedence visually.
 type CellBorders struct {
 	Top, Bottom, Left, Right BorderEdge
+	TL2BR, TR2BL             BorderEdge
 }
 
 // TableBorders mirrors <w:tblBorders>. It carries the four outer edges
@@ -783,7 +1333,9 @@ type Numbering struct {
 }
 
 type AbstractNum struct {
-	Levels map[int]NumLevel // ilvl → level definition
+	Levels       map[int]NumLevel // ilvl → level definition
+	StyleLink    string           // w:styleLink — id this abstractNum implements
+	NumStyleLink string           // w:numStyleLink — link to canonical abstractNum
 }
 
 // NumLevel describes how one indent level is rendered.

@@ -33,12 +33,6 @@ func (r *renderer) drawFrame(p docx.Paragraph) error {
 	savedContentW := r.contentW
 	savedCursorY := r.cursorY
 	savedNoBreak := r.noPageBreak
-	defer func() {
-		r.marL, r.marR = savedMarL, savedMarR
-		r.contentW = savedContentW
-		r.cursorY = savedCursorY
-		r.noPageBreak = savedNoBreak
-	}()
 
 	r.marL = frameX
 	r.contentW = frameW
@@ -50,7 +44,47 @@ func (r *renderer) drawFrame(p docx.Paragraph) error {
 	// Strip the Frame so the inner draw doesn't recurse.
 	inner := p
 	inner.Frame = nil
-	return r.drawParagraph(inner)
+	err := r.drawParagraph(inner)
+	// Capture the bottom edge BEFORE restoring flow state — wrap-band
+	// logic below reads it.
+	frameBottom := r.cursorY
+	r.marL, r.marR = savedMarL, savedMarR
+	r.contentW = savedContentW
+	r.cursorY = savedCursorY
+	r.noPageBreak = savedNoBreak
+	if err != nil {
+		return err
+	}
+	// wrap="around" / "tight" / "through": after drawing the frame, set
+	// the floatBand so subsequent body paragraphs wrap around it.
+	// Without this, body text whose y-range overlaps the frame would
+	// just draw straight through. Frame side defaults to left when
+	// XAlign isn't set — Word centers/wraps the same way for textbox
+	// frames whose XAlign was implied by w:x.
+	if fr.Wrap == "around" || fr.Wrap == "tight" || fr.Wrap == "through" {
+		bottom := frameBottom
+		if bottom <= frameY {
+			// Fall back to declared frame height when the paragraph drew
+			// nothing measurable (e.g. an empty frame).
+			fh := twipsToPt(fr.HeightTwips)
+			if fh <= 0 {
+				fh = r.opts.DefaultFontSize * 1.6
+			}
+			bottom = frameY + fh
+		}
+		side := "left"
+		if fr.XAlign == "right" || fr.XAlign == "outside" {
+			side = "right"
+		}
+		r.floatBand = &floatWrapBand{
+			leftX:   frameX,
+			rightX:  frameX + frameW,
+			bottomY: bottom,
+			side:    side,
+			gapPt:   6,
+		}
+	}
+	return nil
 }
 
 // resolveFrameX returns the frame's absolute left edge in points.

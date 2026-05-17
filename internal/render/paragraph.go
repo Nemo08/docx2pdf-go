@@ -9,6 +9,10 @@ import (
 )
 
 func (r *renderer) drawParagraph(p docx.Paragraph) error {
+	// Drop any wrap-around band that has been outgrown by the cursor —
+	// otherwise paragraphs after the floating image start with stale
+	// narrowing.
+	r.clearExpiredFloatBand()
 	// Positioned frame (w:framePr with placement attrs): render the
 	// paragraph in its anchored absolute position without touching the
 	// document flow. Surrounding body text is NOT reflowed around the
@@ -44,13 +48,39 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	// still shift the page; close enough for "click to jump near
 	// chapter".
 	if title := headingTitle(p); title != "" {
+		// Heading level → indent in the PDF outline. gopdf doesn't model
+		// a real nested-outline tree (only a flat list), so we approximate
+		// hierarchy by prefixing N-1 figure-spaces per level. The
+		// resulting sidebar reads as Heading 1 > Heading 2 > ... without
+		// requiring upstream support for sub-outlines.
+		level := outlineLevelFromStyle(p.StyleID, p.OutlineLvl)
+		if level > 1 {
+			title = strings.Repeat("  ", level-1) + title
+		}
 		r.pdf.AddOutline(title)
 	}
 	// RTL paragraph state: drives rune-reversal inside RTL word atoms and
 	// line-internal atom reversal at flush time. Set before runsToAtoms so
 	// atom construction sees it.
 	r.paragraphRTL = p.Bidi
-	defer func() { r.paragraphRTL = false }()
+	// East Asian line-break rules default to ON unless the paragraph
+	// explicitly turned them off via w:kinsoku w:val="false".
+	r.paragraphKinsoku = p.Kinsoku == nil || *p.Kinsoku
+	// w:overflowPunct (default ON in Word) controls whether trailing
+	// punctuation may overhang the right margin instead of forcing a
+	// wrap. Our Kinsoku no-start logic IS the overhang implementation,
+	// so this flag effectively turns it off when explicitly false.
+	r.paragraphOverflowPunct = p.OverflowPunct == nil || *p.OverflowPunct
+	// w:wordWrap (default ON) allows Latin mid-word breaking when a long
+	// word doesn't fit. When false, the long word overflows the margin
+	// rather than being split — typical for headings.
+	r.paragraphWordWrap = p.WordWrap == nil || *p.WordWrap
+	defer func() {
+		r.paragraphRTL = false
+		r.paragraphKinsoku = false
+		r.paragraphOverflowPunct = true
+		r.paragraphWordWrap = true
+	}()
 	// RTL paragraphs whose alignment was not explicit default to right.
 	// The parser's AlignLeft is the zero value and indistinguishable from
 	// "not set", so we err on the side of doing the natural thing for
@@ -105,6 +135,13 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 		r.cursorY += size * 1.2
 		return nil
 	}
+
+	// w:pBdr top/left/right/bottom — paint a frame around the paragraph
+	// content. Top is drawn before content starts; verticals + bottom
+	// after content finishes (we capture the paragraph's start-y now
+	// and the end-y after layout). The "bottom only on an empty para"
+	// HR case was already handled above via isHorizontalRuleParagraph.
+	pbdrTopY := r.cursorY
 
 	// Effective body indent: paragraph override beats lvl value.
 	leftIndent := listIndent
@@ -163,11 +200,50 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	r.pendingMarker = nil
 	r.firstLineHangPt = 0
 
+	// Paint full pBdr (top/left/right/bottom) around the content area
+	// just laid out. Bottom is drawn BEFORE SpacingAfter so the rule
+	// hugs the text. The HR-only case was handled earlier.
+	pbdrBottomY := r.cursorY
+	r.drawParagraphFrameBorders(p, pbdrTopY, pbdrBottomY)
+	// Revision change bar: in show-revisions mode, paint a 1pt vertical
+	// rule in the left margin next to any paragraph that contains a
+	// tracked-change run (ins/del/moveFrom/moveTo). This matches Word's
+	// default "Change bars" balloon-margin convention, except we draw a
+	// paragraph-spanning bar rather than per-line (we don't know the
+	// per-line revision mask at this layer).
+	if r.opts.ShowRevisions && paragraphHasRevision(p) {
+		r.drawRevisionChangeBar(pbdrTopY, pbdrBottomY)
+	}
+
 	if p.SpacingAfter > 0 {
 		r.cursorY += p.SpacingAfter
 	}
 	r.prevStyleID = p.StyleID
 	return nil
+}
+
+// drawParagraphFrameBorders paints any combination of top / bottom /
+// left / right edges declared in w:pBdr. The four edges share the same
+// BorderEdge shape as table cells (width Sz in pt, hex Color, style).
+func (r *renderer) drawParagraphFrameBorders(p docx.Paragraph, topY, bottomY float64) {
+	b := p.Borders
+	if !(b.Top.Has() || b.Bottom.Has() || b.Left.Has() || b.Right.Has()) {
+		return
+	}
+	leftX := r.marL
+	rightX := r.marL + r.contentW
+	if b.Top.Has() {
+		drawCellEdge(r, b.Top, leftX, topY, rightX, topY)
+	}
+	if b.Bottom.Has() {
+		drawCellEdge(r, b.Bottom, leftX, bottomY, rightX, bottomY)
+	}
+	if b.Left.Has() {
+		drawCellEdge(r, b.Left, leftX, topY, leftX, bottomY)
+	}
+	if b.Right.Has() {
+		drawCellEdge(r, b.Right, rightX, topY, rightX, bottomY)
+	}
 }
 
 // restoreParagraphState rolls back marL/contentW/lineHeight to the values
@@ -177,8 +253,7 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 func (r *renderer) restoreParagraphState(savedColIdx int, savedMarL, savedContentW float64, savedLine docx.LineHeight) {
 	r.lineHeight = savedLine
 	if r.colIdx != savedColIdx {
-		r.marL = r.colBaseX + float64(r.colIdx)*(r.colW+r.colGap)
-		r.contentW = r.colW
+		r.applyColumn(r.colIdx)
 		return
 	}
 	r.marL = savedMarL
@@ -278,12 +353,17 @@ func formatNumber(n int, fmtName string) string {
 		n = 1
 	}
 	switch fmtName {
-	case "decimal", "decimalZero":
-		// We intentionally don't zero-pad decimalZero — the existing
-		// test suite locks in the "3" form for n=3. Word zero-pads at
-		// any width width=1 but tooling that consumes the output
-		// expects raw numerals.
+	case "decimal":
 		return strconv.Itoa(n)
+	case "decimalZero":
+		if n < 10 {
+			return "0" + strconv.Itoa(n)
+		}
+		return strconv.Itoa(n)
+	case "decimalHalfWidth":
+		return strconv.Itoa(n)
+	case "decimalFullWidth", "decimalFullWidth2":
+		return fullWidthDigits(n)
 	case "lowerLetter":
 		return alphaLabel(n, false)
 	case "upperLetter":
@@ -304,20 +384,30 @@ func formatNumber(n int, fmtName string) string {
 		return cardinalText(n)
 	case "chineseCounting", "chineseCountingThousand", "ideographDigital":
 		return chineseCounting(n)
+	case "chineseLegalSimplified":
+		return chineseLegalSimplified(n)
 	case "ideographTraditional":
 		return ideographTraditional(n)
 	case "ideographLegalTraditional":
 		return ideographLegalTraditional(n)
-	case "decimalEnclosedCircle":
+	case "decimalEnclosedCircle", "decimalEnclosedCircleChinese":
 		return decimalEnclosedCircle(n)
 	case "decimalEnclosedParen":
 		return "(" + strconv.Itoa(n) + ")"
 	case "decimalEnclosedFullstop":
 		return strconv.Itoa(n) + "."
+	case "numberInDash":
+		return "- " + strconv.Itoa(n) + " -"
 	case "hex":
 		return strings.ToUpper(strconv.FormatInt(int64(n), 16))
-	case "japaneseCounting":
+	case "japaneseCounting", "japaneseDigitalTenThousand":
 		return chineseCounting(n)
+	case "japaneseLegal":
+		return chineseLegalSimplified(n)
+	case "koreanCounting", "koreanDigital", "koreanDigital2":
+		return koreanCounting(n)
+	case "koreanLegal":
+		return koreanLegal(n)
 	case "aiueo":
 		return aiueoLabel(n, false)
 	case "aiueoFullWidth":
@@ -326,9 +416,320 @@ func formatNumber(n int, fmtName string) string {
 		return irohaLabel(n, false)
 	case "irohaFullWidth":
 		return irohaLabel(n, true)
+	case "thaiNumbers", "thaiCountingThousand":
+		return thaiDigits(n)
+	case "ganada":
+		return ganadaLabel(n)
+	case "chosung":
+		return chosungLabel(n)
+	case "arabicAlpha":
+		return arabicAlphaLabel(n)
+	case "arabicAbjad":
+		return arabicAbjadLabel(n)
+	case "hindiVowels":
+		return hindiVowelsLabel(n)
+	case "hindiConsonants":
+		return hindiConsonantsLabel(n)
+	case "hindiNumbers":
+		return hindiDigits(n)
+	case "hebrew1":
+		return hebrew1Label(n)
+	case "hebrew2":
+		return hebrew2Label(n)
+	case "russianLower":
+		return russianLetterLabel(n, false)
+	case "russianUpper":
+		return russianLetterLabel(n, true)
+	case "vietnameseCounting":
+		return vietnameseCounting(n)
+	case "bengaliCounting":
+		return bengaliCounting(n)
+	case "bengaliNumbers":
+		return bengaliDigits(n)
+	case "taiwaneseCounting", "taiwaneseCountingThousand", "taiwaneseDigital":
+		return ideographTraditional(n)
+	case "ideographZodiac":
+		return zodiacLabel(n, false)
+	case "ideographZodiacTraditional":
+		return zodiacLabel(n, true)
+	case "thaiLetters":
+		return thaiLettersLabel(n)
 	default:
 		return strconv.Itoa(n)
 	}
+}
+
+// zodiacLabel returns the Chinese 12-animal zodiac character for n.
+// Traditional adds a tick when the cycle wraps past 12.
+func zodiacLabel(n int, traditional bool) string {
+	cycle := []rune{'鼠', '牛', '虎', '兔', '龍', '蛇', '馬', '羊', '猴', '雞', '狗', '豬'}
+	if n < 1 {
+		return strconv.Itoa(n)
+	}
+	idx := (n - 1) % 12
+	repeat := (n - 1) / 12
+	out := string(cycle[idx])
+	if traditional && repeat > 0 {
+		out += strings.Repeat("ʹ", repeat)
+	}
+	return out
+}
+
+// thaiLettersLabel cycles through Thai consonants (ก..ฮ).
+func thaiLettersLabel(n int) string {
+	letters := []rune{
+		'ก', 'ข', 'ฃ', 'ค', 'ฅ', 'ฆ', 'ง', 'จ', 'ฉ', 'ช', 'ซ',
+		'ฌ', 'ญ', 'ฎ', 'ฏ', 'ฐ', 'ฑ', 'ฒ', 'ณ', 'ด', 'ต', 'ถ',
+		'ท', 'ธ', 'น', 'บ', 'ป', 'ผ', 'ฝ', 'พ', 'ฟ', 'ภ', 'ม',
+		'ย', 'ร', 'ล', 'ว', 'ศ', 'ษ', 'ส', 'ห', 'ฬ', 'อ', 'ฮ',
+	}
+	if n < 1 {
+		return strconv.Itoa(n)
+	}
+	idx := (n - 1) % len(letters)
+	repeat := (n - 1) / len(letters)
+	return strings.Repeat(string(letters[idx]), repeat+1)
+}
+
+// hebrew1Label returns the additive hebrew-numeral form for n (1..999).
+// Standard ordering א=1, ב=2, ... ת=400. Larger values cascade by
+// stacking hundreds → tens → ones.
+func hebrew1Label(n int) string {
+	if n <= 0 {
+		return strconv.Itoa(n)
+	}
+	ones := []string{"", "א", "ב", "ג", "ד", "ה", "ו", "ז", "ח", "ט"}
+	tens := []string{"", "י", "כ", "ל", "מ", "נ", "ס", "ע", "פ", "צ"}
+	hundreds := []string{"", "ק", "ר", "ש", "ת"}
+	var b strings.Builder
+	if n >= 1000 {
+		// fall back to numeric for huge values
+		return strconv.Itoa(n)
+	}
+	h := n / 100
+	t := (n % 100) / 10
+	o := n % 10
+	for h > 4 {
+		b.WriteString("ת")
+		h -= 4
+	}
+	b.WriteString(hundreds[h])
+	switch n % 100 {
+	case 15:
+		b.WriteString("טו")
+	case 16:
+		b.WriteString("טז")
+	default:
+		b.WriteString(tens[t])
+		b.WriteString(ones[o])
+	}
+	return b.String()
+}
+
+// hebrew2Label is the "spelled-out" reverse-ordered variant. We use the
+// same letters but read RTL — Word's hebrew2 also adds a geresh tick.
+func hebrew2Label(n int) string {
+	s := hebrew1Label(n)
+	if len(s) >= 4 {
+		return s + "׳"
+	}
+	return s
+}
+
+// russianLetterLabel cycles through the Cyrillic alphabet, skipping
+// reserved letters (Ё, Й, Ъ, Ы, Ь) that Word also skips.
+func russianLetterLabel(n int, upper bool) string {
+	lower := []rune{'а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'к', 'л', 'м', 'н',
+		'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'щ', 'э', 'ю', 'я'}
+	if n < 1 {
+		return strconv.Itoa(n)
+	}
+	idx := (n - 1) % len(lower)
+	repeat := (n - 1) / len(lower)
+	c := lower[idx]
+	if upper {
+		c -= 0x20
+	}
+	out := strings.Repeat(string(c), repeat+1)
+	return out
+}
+
+// vietnameseCounting produces traditional Vietnamese number words for
+// small n; falls back to digits above 20 (spelling out compounds
+// requires a fuller grammar than we model).
+func vietnameseCounting(n int) string {
+	words := []string{
+		"", "Một", "Hai", "Ba", "Bốn", "Năm",
+		"Sáu", "Bảy", "Tám", "Chín", "Mười",
+		"Mười Một", "Mười Hai", "Mười Ba", "Mười Bốn", "Mười Lăm",
+		"Mười Sáu", "Mười Bảy", "Mười Tám", "Mười Chín", "Hai Mươi",
+	}
+	if n >= 1 && n < len(words) {
+		return words[n]
+	}
+	return strconv.Itoa(n)
+}
+
+// bengaliDigits maps decimal digits to the Bengali script (০ … ৯).
+func bengaliDigits(n int) string {
+	s := strconv.Itoa(n)
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(0x09E6 + (r - '0'))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// bengaliCounting is the Bengali-script counting form; we use digits for
+// simplicity since spelled-out forms vary regionally.
+func bengaliCounting(n int) string {
+	return bengaliDigits(n)
+}
+
+func fullWidthDigits(n int) string {
+	s := strconv.Itoa(n)
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(0xFF10 + (r - '0'))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func chineseLegalSimplified(n int) string {
+	digits := []rune("零壹贰叁肆伍陆柒捌玖")
+	if n < 10 {
+		return string(digits[n])
+	}
+	if n < 20 {
+		if n == 10 {
+			return "拾"
+		}
+		return "拾" + string(digits[n-10])
+	}
+	if n < 100 {
+		tens, ones := n/10, n%10
+		out := string(digits[tens]) + "拾"
+		if ones > 0 {
+			out += string(digits[ones])
+		}
+		return out
+	}
+	return chineseCounting(n)
+}
+
+func thaiDigits(n int) string {
+	s := strconv.Itoa(n)
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(0x0E50 + (r - '0'))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func hindiDigits(n int) string {
+	s := strconv.Itoa(n)
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(0x0966 + (r - '0'))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func koreanCounting(n int) string {
+	digits := []rune("영일이삼사오육칠팔구")
+	if n < 10 {
+		return string(digits[n])
+	}
+	if n < 20 {
+		if n == 10 {
+			return "십"
+		}
+		return "십" + string(digits[n-10])
+	}
+	if n < 100 {
+		tens, ones := n/10, n%10
+		out := string(digits[tens]) + "십"
+		if ones > 0 {
+			out += string(digits[ones])
+		}
+		return out
+	}
+	return strconv.Itoa(n)
+}
+
+func koreanLegal(n int) string {
+	digits := []rune("영일이삼사오육칠팔구")
+	if n < 10 {
+		return string(digits[n])
+	}
+	return koreanCounting(n)
+}
+
+func ganadaLabel(n int) string {
+	letters := []rune{'가', '나', '다', '라', '마', '바', '사', '아', '자', '차', '카', '타', '파', '하'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+func chosungLabel(n int) string {
+	letters := []rune{'ㄱ', 'ㄴ', 'ㄷ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅅ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+func arabicAlphaLabel(n int) string {
+	letters := []rune{'ا', 'ب', 'ت', 'ث', 'ج', 'ح', 'خ', 'د', 'ذ', 'ر', 'ز', 'س', 'ش', 'ص', 'ض',
+		'ط', 'ظ', 'ع', 'غ', 'ف', 'ق', 'ك', 'ل', 'م', 'ن', 'ه', 'و', 'ي'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+func arabicAbjadLabel(n int) string {
+	letters := []rune{'ا', 'ب', 'ج', 'د', 'ه', 'و', 'ز', 'ح', 'ط', 'ي', 'ك', 'ل', 'م', 'ن', 'س',
+		'ع', 'ف', 'ص', 'ق', 'ر', 'ش', 'ت', 'ث', 'خ', 'ذ', 'ض', 'ظ', 'غ'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+func hindiVowelsLabel(n int) string {
+	letters := []rune{'अ', 'आ', 'इ', 'ई', 'उ', 'ऊ', 'ऋ', 'ए', 'ऐ', 'ओ', 'औ'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
+}
+
+func hindiConsonantsLabel(n int) string {
+	letters := []rune{'क', 'ख', 'ग', 'घ', 'ङ', 'च', 'छ', 'ज', 'झ', 'ञ', 'ट', 'ठ', 'ड', 'ढ', 'ण',
+		'त', 'थ', 'द', 'ध', 'न', 'प', 'फ', 'ब', 'भ', 'म', 'य', 'र', 'ल', 'व', 'श', 'ष', 'स', 'ह'}
+	if n >= 1 && n <= len(letters) {
+		return string(letters[n-1])
+	}
+	return strconv.Itoa(n)
 }
 
 // ordinalLabel returns "1st", "2nd", "3rd", "4th"…
@@ -538,6 +939,36 @@ func headingTitle(p docx.Paragraph) string {
 		b.WriteString(run.Text)
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// outlineLevelFromStyle maps a paragraph's style ID and explicit
+// w:outlineLvl onto a 1-based PDF outline depth. Title and Heading1
+// both resolve to depth 1; Heading2 → 2; etc. An explicit outlineLvl
+// (0..9, where 0 = top) wins when set, since some templates apply
+// outline levels via direct formatting on non-heading styles.
+func outlineLevelFromStyle(styleID string, outlineLvl int) int {
+	if outlineLvl >= 0 && outlineLvl <= 9 {
+		// w:outlineLvl is 0-based (0 = top); convert to a 1-based depth.
+		// We use outlineLvl only when the style isn't a Heading variant
+		// — Heading styles trump because they're the conventional source.
+		if !isHeadingStyle(styleID) {
+			return outlineLvl + 1
+		}
+	}
+	low := strings.ToLower(strings.ReplaceAll(styleID, " ", ""))
+	if low == "title" {
+		return 1
+	}
+	if strings.HasPrefix(low, "heading") {
+		rest := low[len("heading"):]
+		if rest == "" {
+			return 1
+		}
+		if n, err := strconv.Atoi(rest); err == nil && n >= 1 && n <= 9 {
+			return n
+		}
+	}
+	return 1
 }
 
 func isHeadingStyle(id string) bool {

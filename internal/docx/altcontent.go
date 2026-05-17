@@ -81,7 +81,7 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 		case xml.StartElement:
 			switch t.Name.Local {
 			case "drawing":
-				di, err := findDrawingInfo(dec, t)
+				di, err := findDrawingInfo(dec, t, doc)
 				if err != nil {
 					return nil, err
 				}
@@ -109,7 +109,7 @@ func decodeRunAltBranch(dec *xml.Decoder, start xml.StartElement, rp RunProps, d
 					out = append(out, Run{Text: di.TxbxText, Props: trp})
 				}
 			case "pict":
-				vi, err := findPictInfo(dec, t)
+				vi, err := findPictInfo(dec, t, doc)
 				if err != nil {
 					return nil, err
 				}

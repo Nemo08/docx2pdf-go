@@ -131,7 +131,8 @@ func TestFormatNumber(t *testing.T) {
 		want   string
 	}{
 		{3, "decimal", "3"},
-		{3, "decimalZero", "3"},
+		{3, "decimalZero", "03"},
+		{11, "decimalZero", "11"},
 		{3, "lowerLetter", "c"},
 		{3, "upperLetter", "C"},
 		{3, "lowerRoman", "iii"},

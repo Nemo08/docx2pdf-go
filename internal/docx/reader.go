@@ -12,6 +12,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
 // Open reads and parses a .docx file at path. It is a thin wrapper around
@@ -89,15 +93,31 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		_ = parseAppProps(f, &doc.Properties)
 	}
 
+	if f, ok := files["word/glossary/document.xml"]; ok {
+		doc.HasGlossary = true
+		_ = parseGlossaryPart(f, doc)
+	}
+
+	if f, ok := files["word/fontTable.xml"]; ok {
+		fontRels := map[string]relEntry{}
+		if rf, ok := files["word/_rels/fontTable.xml.rels"]; ok {
+			_ = parseRels(rf, fontRels)
+		}
+		_ = parseFontTable(f, fontRels, files, doc)
+	}
+
 	if f, ok := files["word/styles.xml"]; ok {
 		if err := parseStyles(f, doc); err != nil {
 			return nil, fmt.Errorf("styles.xml: %w", err)
 		}
 	}
 	if f, ok := files["word/settings.xml"]; ok {
-		// Settings are best-effort: a malformed settings.xml shouldn't
-		// keep the document from rendering. Defaults take over.
-		_ = parseSettings(f, &doc.Settings)
+		// Settings are best-effort.
+		_ = parseSettings(f, doc)
+	}
+	if f, ok := files["docProps/custom.xml"]; ok {
+		doc.CustomProperties = map[string]string{}
+		_ = parseCustomProperties(f, doc.CustomProperties)
 	}
 
 	rels := map[string]relEntry{} // rId → relationship metadata
@@ -119,6 +139,13 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			if !ok {
 				continue
 			}
+			if label, ok := vectorMediaFormat(e.Target, zf); ok {
+				if doc.UnsupportedMedia == nil {
+					doc.UnsupportedMedia = map[string]string{}
+				}
+				doc.UnsupportedMedia[rid] = label
+				continue
+			}
 			img, err := loadImage(zf)
 			if err != nil {
 				continue
@@ -127,10 +154,15 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		}
 	}
 
+	// Custom XML stores + alt-chunk text parts.
+	loadCustomXMLParts(rels, files, doc)
+	loadAltChunks(rels, files, doc)
+
 	if f, ok := files["word/numbering.xml"]; ok {
 		if err := parseNumbering(f, &doc.Numbering); err != nil {
 			return nil, fmt.Errorf("numbering.xml: %w", err)
 		}
+		resolveNumStyleLinks(&doc.Numbering)
 	}
 
 	if f, ok := files["word/footnotes.xml"]; ok {
@@ -144,12 +176,15 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		}
 	}
 	if f, ok := files["word/comments.xml"]; ok {
-		// Comments share the parseNotes structure: each <w:comment w:id="…">
-		// holds inner paragraphs. We reuse the same decoder with the
-		// element name "comment".
-		if err := parseNotes(f, doc, "comment", doc.Comments); err != nil {
+		if err := parseComments(f, doc); err != nil {
 			return nil, fmt.Errorf("comments.xml: %w", err)
 		}
+	}
+	if f, ok := files["word/commentsExtended.xml"]; ok {
+		_ = parseCommentsExtended(f, doc)
+	}
+	if f, ok := files["word/people.xml"]; ok {
+		_ = parsePeople(f, doc)
 	}
 
 	// Pre-parse header/footer parts before document.xml. We need them by rId
@@ -175,26 +210,51 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 			}
 		case isChartRel(e.Type):
 			// Charts live in their own part (word/charts/chartN.xml).
-			// Best-effort: pull all CharData out of the chart subtree so
-			// titles, axis labels, and data labels survive. Geometry
-			// and the actual series glyphs are out of scope.
+			// We try structural parsing first so the renderer can paint a
+			// real bar/pie/line graphic; if the chart family isn't one we
+			// understand, we still keep the flat text extraction so titles
+			// and labels survive in the PDF text stream.
 			full := "word/" + e.Target
 			zf, ok := files[full]
 			if !ok {
 				continue
 			}
 			txt, err := extractChartText(zf)
-			if err != nil {
-				continue // tolerate malformed chart part
+			if err == nil && txt != "" {
+				doc.Charts[rid] = txt
 			}
-			doc.Charts[rid] = txt
+			data, err := extractChartStruct(zf)
+			if err == nil && data.Kind != "" {
+				if doc.ChartsData == nil {
+					doc.ChartsData = map[string]ChartData{}
+				}
+				doc.ChartsData[rid] = data
+			}
+		case isOLEObjectRel(e.Type), isPackageRel(e.Type):
+			full := "word/" + e.Target
+			zf, ok := files[full]
+			if !ok {
+				continue
+			}
+			// Only attempt Excel extraction. Other OLE servers
+			// (Equation.3, Visio.Drawing) are left alone — caller
+			// keeps the preview image.
+			if strings.HasSuffix(strings.ToLower(e.Target), ".xlsx") ||
+				strings.HasSuffix(strings.ToLower(e.Target), ".xlsm") {
+				if embed, err := extractExcelEmbed(zf); err == nil && len(embed.Cells) > 0 {
+					if doc.OLEEmbeds == nil {
+						doc.OLEEmbeds = map[string]ExcelEmbed{}
+					}
+					doc.OLEEmbeds[rid] = embed
+				}
+			}
 		case isDiagramDataRel(e.Type):
 			// SmartArt data part (word/diagrams/dataN.xml). We extract
-			// the per-node text (dgm:pt/dgm:t descendants) and join it
-			// with " → " so the diagram's conceptual ordering survives
-			// in the PDF text stream. The actual graphical layout is
-			// out of scope — would need to consume the layout/colors/
-			// quickStyle parts and run the diagram algorithm.
+			// the per-node text first; then try to pair with the sibling
+			// drawing part (word/diagrams/drawingN.xml) Word writes when
+			// it pre-renders the SmartArt visuals. When the drawing is
+			// present we get a real shape tree; otherwise we still
+			// surface the flat text.
 			full := "word/" + e.Target
 			zf, ok := files[full]
 			if !ok {
@@ -205,6 +265,14 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 				continue
 			}
 			doc.Diagrams[rid] = txt
+			if drawingZF := diagramSiblingDrawing(files, e.Target); drawingZF != nil {
+				if sh, err := extractDiagramDrawing(drawingZF); err == nil && sh != nil {
+					if doc.DiagramShapes == nil {
+						doc.DiagramShapes = map[string]*VMLShape{}
+					}
+					doc.DiagramShapes[rid] = sh
+				}
+			}
 		}
 	}
 
@@ -241,6 +309,21 @@ type parseDocContext struct {
 	// between for REF field resolution. Maps are nil when nothing is open.
 	bmIDToName map[string]string
 	bmActive   map[string]bool
+
+	// repeatStack tracks the active OpenDoPE od:repeat scope so that
+	// nested SDT XPath references resolved during a clone iteration
+	// see the correct positional predicate. Top of stack = innermost
+	// repeat.
+	repeatStack []openDopeRepeatFrame
+}
+
+// openDopeRepeatFrame describes one active repeat scope while we're
+// cloning an SDT's content. The renderer uses xpathPrefix to detect
+// inner XPaths that drill into the repeat's data, and rewrites them so
+// the i-th clone reads the i-th match.
+type openDopeRepeatFrame struct {
+	xpathPrefix string // e.g. "/Root/Items/Item"
+	index       int    // 1-based iteration index
 }
 
 // finalizeSection appends the in-progress section to doc.Sections, applies
@@ -408,6 +491,26 @@ func parseCoreProps(f *zip.File, p *Properties) error {
 			if err := dec.DecodeElement(&s, &se); err == nil {
 				p.Subject = s
 			}
+		case "keywords":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Keywords = s
+			}
+		case "description":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.Comments = s
+			}
+		case "created":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.CreateDate = s
+			}
+		case "modified":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.ModifyDate = s
+			}
+		case "lastPrinted":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				p.PrintDate = s
+			}
 		}
 	}
 }
@@ -463,14 +566,19 @@ func parseAppProps(f *zip.File, p *Properties) error {
 					p.Lines = x
 				}
 			}
+		case "TotalTime":
+			if err := dec.DecodeElement(&s, &se); err == nil {
+				if x, err := strconv.Atoi(s); err == nil {
+					p.TotalTime = x
+				}
+			}
 		}
 	}
 }
 
-// parseSettings reads the leaf flags from word/settings.xml that the
-// renderer can consume. Word stores most settings as empty elements where
-// presence = true (e.g. <w:evenAndOddHeaders/>); a few carry a w:val.
-func parseSettings(f *zip.File, s *Settings) error {
+// parseSettings reads the leaf flags from word/settings.xml.
+func parseSettings(f *zip.File, doc *Document) error {
+	s := &doc.Settings
 	rc, err := openZipFile(f)
 	if err != nil {
 		return err
@@ -503,6 +611,77 @@ func parseSettings(f *zip.File, s *Settings) error {
 				}
 			}
 			_ = dec.Skip()
+		case "autoHyphenation":
+			s.AutoHyphenation = onOffValAttr(se)
+			_ = dec.Skip()
+		case "consecutiveHyphenLimit":
+			if v := attr(se, "val"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil {
+					s.ConsecutiveHyphenLimit = x
+				}
+			}
+			_ = dec.Skip()
+		case "hyphenationZone":
+			if v := attr(se, "val"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil {
+					s.HyphenationZoneTwips = x
+				}
+			}
+			_ = dec.Skip()
+		case "doNotHyphenateCaps":
+			s.DoNotHyphenateCaps = onOffValAttr(se)
+			_ = dec.Skip()
+		case "characterSpacingControl":
+			s.CharacterSpacingControl = attr(se, "val")
+			_ = dec.Skip()
+		case "compat":
+			if err := decodeCompat(dec, se, s); err != nil {
+				return err
+			}
+		case "documentProtection":
+			s.DocumentProtection.Edit = attr(se, "edit")
+			s.DocumentProtection.Enforcement = attr(se, "enforcement") == "1" || attr(se, "enforcement") == "true"
+			s.DocumentProtection.FormatLockdown = attr(se, "formatting") == "1" || attr(se, "formatting") == "true"
+			s.DocumentProtection.AlgorithmName = attr(se, "cryptAlgorithmName")
+			s.DocumentProtection.CryptProviderTyp = attr(se, "cryptProviderType")
+			_ = dec.Skip()
+		case "writeProtection":
+			s.WriteProtection.Recommended = attr(se, "recommended") == "1" || attr(se, "recommended") == "true"
+			s.WriteProtection.Enforcement = attr(se, "enforcement") == "1" || attr(se, "enforcement") == "true"
+			s.WriteProtection.AlgorithmName = attr(se, "cryptAlgorithmName")
+			s.WriteProtection.CryptProviderTyp = attr(se, "cryptProviderType")
+			_ = dec.Skip()
+		case "docVars":
+			if doc.DocVars == nil {
+				doc.DocVars = map[string]string{}
+			}
+			if err := decodeDocVars(dec, se, doc.DocVars); err != nil {
+				return err
+			}
+		case "mailMerge":
+			depth := 1
+			for depth > 0 {
+				tok, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				switch t := tok.(type) {
+				case xml.StartElement:
+					depth++
+					if t.Name.Local == "mainDocumentType" {
+						if v := attr(t, "val"); v != "" {
+							doc.MailMerge = v
+						} else {
+							doc.MailMerge = "formLetter"
+						}
+					}
+				case xml.EndElement:
+					depth--
+				}
+			}
+			if doc.MailMerge == "" {
+				doc.MailMerge = "formLetter"
+			}
 		}
 	}
 }
@@ -679,6 +858,67 @@ func loadImage(zf *zip.File) (image.Image, error) {
 	return img, err
 }
 
+// vectorMediaFormat detects EMF and WMF metafiles by extension or magic
+// bytes. Returns a label for the placeholder.
+func vectorMediaFormat(target string, zf *zip.File) (string, bool) {
+	lower := strings.ToLower(target)
+	switch {
+	case strings.HasSuffix(lower, ".emf"):
+		return "EMF", true
+	case strings.HasSuffix(lower, ".wmf"):
+		return "WMF", true
+	}
+	rc, err := zf.Open()
+	if err != nil {
+		return "", false
+	}
+	defer rc.Close()
+	var head [8]byte
+	n, _ := io.ReadFull(rc, head[:])
+	if n < 4 {
+		return "", false
+	}
+	if head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x00 && head[3] == 0x00 {
+		return "EMF", true
+	}
+	if head[0] == 0xD7 && head[1] == 0xCD && head[2] == 0xC6 && head[3] == 0x9A {
+		return "WMF", true
+	}
+	if head[0] == 0x01 && head[1] == 0x00 && head[2] == 0x09 && head[3] == 0x00 {
+		return "WMF", true
+	}
+	return "", false
+}
+
+// resolveNumStyleLinks rewrites every abstractNum that carries a
+// w:numStyleLink so it borrows the levels of the linked abstractNum.
+func resolveNumStyleLinks(n *Numbering) {
+	if len(n.Abstract) == 0 {
+		return
+	}
+	byStyleLink := map[string]int{}
+	for id, an := range n.Abstract {
+		if an.StyleLink != "" {
+			byStyleLink[an.StyleLink] = id
+		}
+	}
+	for id, an := range n.Abstract {
+		if an.NumStyleLink == "" || len(an.Levels) > 0 {
+			continue
+		}
+		target, ok := byStyleLink[an.NumStyleLink]
+		if !ok || target == id {
+			continue
+		}
+		ref := n.Abstract[target]
+		an.Levels = map[int]NumLevel{}
+		for k, v := range ref.Levels {
+			an.Levels[k] = v
+		}
+		n.Abstract[id] = an
+	}
+}
+
 // --- styles.xml ---------------------------------------------------------
 
 // xmlStyles binds the bits of styles.xml we actually consume:
@@ -707,6 +947,9 @@ type xmlStyle struct {
 	BasedOn *struct {
 		Val string `xml:"val,attr"`
 	} `xml:"basedOn"`
+	Link *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"link"`
 	PPr   *xmlStylePPr   `xml:"pPr"`
 	RPr   *xmlRPr        `xml:"rPr"`
 	TblPr *xmlStyleTblPr `xml:"tblPr"`
@@ -856,6 +1099,9 @@ func parseStyles(f *zip.File, doc *Document) error {
 		if xs.BasedOn != nil {
 			ps.BasedOn = xs.BasedOn.Val
 		}
+		if xs.Link != nil {
+			ps.LinkedCharStyle = xs.Link.Val
+		}
 		if xs.RPr != nil {
 			ps.Run = rPrToProps(*xs.RPr, RunProps{})
 		}
@@ -940,6 +1186,9 @@ func mergeStyles(parent, child ParagraphStyle) ParagraphStyle {
 	}
 	if child.LineHeight.Rule != "" {
 		out.LineHeight = child.LineHeight
+	}
+	if child.LinkedCharStyle != "" {
+		out.LinkedCharStyle = child.LinkedCharStyle
 	}
 	return out
 }
@@ -1159,6 +1408,17 @@ func isDiagramDataRel(t string) bool {
 	return strings.HasSuffix(t, "/diagramData") || strings.HasSuffix(t, "/diagram/dataModel")
 }
 
+// isOLEObjectRel matches the w:object OLE blob relationship.
+func isOLEObjectRel(t string) bool {
+	return strings.HasSuffix(t, "/oleObject")
+}
+
+// isPackageRel matches a generic /package OOXML embedded package — Word
+// uses this for embedded .xlsx / .docx / .pptx attached via w:object.
+func isPackageRel(t string) bool {
+	return strings.HasSuffix(t, "/package")
+}
+
 // extractDiagramText reads a SmartArt data part
 // (word/diagrams/dataN.xml). The data graph carries one <dgm:pt> per
 // node; each node's visible text lives in <dgm:t> descendants. We
@@ -1300,7 +1560,9 @@ func parseNumbering(f *zip.File, out *Numbering) error {
 		switch se.Name.Local {
 		case "numPicBullet":
 			// numPicBullet wraps a w:pict (legacy VML) OR w:drawing containing
-			// the image. We walk the subtree looking for any rId reference.
+			// the image. We walk the subtree looking for any rId reference,
+			// then store it in Numbering.PicBullets so a level whose
+			// w:lvlPicBulletId names this id renders the image as its marker.
 			id, err := strconv.Atoi(attr(se, "numPicBulletId"))
 			if err != nil {
 				_ = dec.Skip()
@@ -1353,14 +1615,21 @@ func decodeAbstractNum(dec *xml.Decoder, start xml.StartElement) (AbstractNum, e
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "lvl" {
+			switch t.Name.Local {
+			case "lvl":
 				ilvl, _ := strconv.Atoi(attr(t, "ilvl"))
 				lv, err := decodeLevel(dec, t)
 				if err != nil {
 					return an, err
 				}
 				an.Levels[ilvl] = lv
-			} else {
+			case "styleLink":
+				an.StyleLink = attr(t, "val")
+				_ = dec.Skip()
+			case "numStyleLink":
+				an.NumStyleLink = attr(t, "val")
+				_ = dec.Skip()
+			default:
 				_ = dec.Skip()
 			}
 		case xml.EndElement:
@@ -1648,6 +1917,81 @@ type xmlRPr struct {
 		HAnsiTheme string `xml:"hAnsiTheme,attr"`
 		EATheme    string `xml:"eastAsiaTheme,attr"`
 	} `xml:"rFonts"`
+	EALayout *struct {
+		ID       string `xml:"id,attr"`
+		Combine  string `xml:"combine,attr"`
+		Brackets string `xml:"combineBrackets,attr"`
+		Vert     string `xml:"vert,attr"`
+		VertC    string `xml:"vertCompress,attr"`
+	} `xml:"eastAsianLayout"`
+	W14Ligatures *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"ligatures"`
+	W14NumForm *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"numForm"`
+	W14NumSpacing *struct {
+		Val string `xml:"val,attr"`
+	} `xml:"numSpacing"`
+	W14CntxtAlts   *xmlValAttr `xml:"cntxtAlts"`
+	W14Shadow      *xmlW14Fill `xml:"shadow"`
+	W14TextOutline *xmlW14Fill `xml:"textOutline"`
+	// RPrChange records w:rPrChange — tracked-change of run properties.
+	// We capture author/id/date attributes; the inner <w:rPr> is the
+	// pre-edit history and is intentionally ignored.
+	RPrChange *xmlPrChangeAttrs `xml:"rPrChange"`
+}
+
+// xmlPrChangeAttrs is the shared *PrChange attribute carrier (id, author,
+// date) used by w:rPrChange / w:sectPrChange / w:tblPrChange / w:tcPrChange /
+// w:trPrChange / w:tblGridChange.
+type xmlPrChangeAttrs struct {
+	ID     string `xml:"id,attr"`
+	Author string `xml:"author,attr"`
+	Date   string `xml:"date,attr"`
+}
+
+// toPrChange returns a *PrChange copy, or nil if attrs is nil.
+func (x *xmlPrChangeAttrs) toPrChange(kind string) *PrChange {
+	if x == nil {
+		return nil
+	}
+	return &PrChange{Kind: kind, ID: x.ID, Author: x.Author, Date: x.Date}
+}
+
+// readPrChangeAttrs pulls (id, author, date) from a *Change element start
+// token without consuming its body. Caller is responsible for skipping
+// the body afterwards.
+func readPrChangeAttrs(t xml.StartElement, kind string) *PrChange {
+	pc := &PrChange{Kind: kind}
+	for _, a := range t.Attr {
+		switch a.Name.Local {
+		case "id":
+			pc.ID = a.Value
+		case "author":
+			pc.Author = a.Value
+		case "date":
+			pc.Date = a.Value
+		}
+	}
+	return pc
+}
+
+// xmlW14Fill captures the w14:solidFill > w14:srgbClr nested chain that
+// Word 2010+ uses for text-effect colors.
+type xmlW14Fill struct {
+	SolidFill *struct {
+		SrgbClr *struct {
+			Val string `xml:"val,attr"`
+		} `xml:"srgbClr"`
+	} `xml:"solidFill"`
+}
+
+func (f *xmlW14Fill) color() string {
+	if f == nil || f.SolidFill == nil || f.SolidFill.SrgbClr == nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.ToUpper(f.SolidFill.SrgbClr.Val), "#")
 }
 
 type xmlValAttr struct {
@@ -1811,6 +2155,50 @@ func rPrToProps(r xmlRPr, base RunProps) RunProps {
 			p.ThemeFontRole = themeFontRole("EastAsia", r.RFonts.EATheme)
 		}
 	}
+	if r.EALayout != nil {
+		ea := &EALayoutInfo{}
+		if r.EALayout.Combine != "" && r.EALayout.Combine != "0" && r.EALayout.Combine != "none" {
+			ea.Combine = true
+		}
+		ea.CombineBrackets = r.EALayout.Brackets
+		if r.EALayout.Vert == "1" || r.EALayout.Vert == "true" {
+			ea.Vert = true
+		}
+		if r.EALayout.VertC == "1" || r.EALayout.VertC == "true" {
+			ea.VertCompress = true
+		}
+		p.EALayout = ea
+	}
+	if r.W14Ligatures != nil && r.W14Ligatures.Val != "" {
+		p.W14Ligatures = r.W14Ligatures.Val
+	}
+	if r.W14NumForm != nil && r.W14NumForm.Val != "" {
+		p.W14NumForm = r.W14NumForm.Val
+	}
+	if r.W14NumSpacing != nil && r.W14NumSpacing.Val != "" {
+		p.W14NumSpacing = r.W14NumSpacing.Val
+	}
+	if r.W14CntxtAlts != nil {
+		v := r.W14CntxtAlts.Val
+		if v == "" {
+			v = "true"
+		}
+		p.W14CntxtAlts = v
+	}
+	if r.W14Shadow != nil {
+		if c := r.W14Shadow.color(); c != "" {
+			p.W14ShadowColor = c
+		} else {
+			p.W14ShadowColor = "808080"
+		}
+	}
+	if r.W14TextOutline != nil {
+		if c := r.W14TextOutline.color(); c != "" {
+			p.W14OutlineColor = c
+		} else {
+			p.W14OutlineColor = "000000"
+		}
+	}
 	return p
 }
 
@@ -1896,14 +2284,16 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 			// Display math: a body-level equation. Best-effort — extract
 			// the visible text and emit it as a centered, italic paragraph.
 			// Loses the structural typesetting but keeps the content.
-			txt, err := extractMathText(dec, se)
+			tree, txt, err := ExtractMathTree(dec, se)
 			if err != nil {
 				return err
 			}
-			if txt != "" {
+			if txt != "" || tree != nil {
+				run := mathRun(txt, doc.Defaults)
+				run.Math = tree
 				p := Paragraph{
 					Alignment: AlignCenter,
-					Runs:      []Run{mathRun(txt, doc.Defaults)},
+					Runs:      []Run{run},
 				}
 				pctx.curSection.Blocks = append(pctx.curSection.Blocks, p)
 				doc.Body = append(doc.Body, p)
@@ -1928,6 +2318,20 @@ func parseDocument(f *zip.File, pctx *parseDocContext) error {
 				return err
 			}
 			pctx.finalizeSection()
+		case "altChunk":
+			// w:altChunk inserts an alternative-format part (HTML / RTF
+			// / text). The text was already extracted to doc.AltChunks
+			// by loadAltChunks — splice those blocks into the body now.
+			rid := attr(se, "id")
+			if rid != "" {
+				if alts, ok := doc.AltChunks[rid]; ok {
+					for _, b := range alts {
+						pctx.curSection.Blocks = append(pctx.curSection.Blocks, b)
+						doc.Body = append(doc.Body, b)
+					}
+				}
+			}
+			_ = dec.Skip()
 		}
 	}
 	// If the document ends without any sectPr (unusual but legal), still
@@ -2025,16 +2429,13 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 					delete(bmActive, name)
 				}
 				_ = dec.Skip()
-			case "ins", "moveTo":
-				// Tracked-change INSERTION or move-to (the new location of
-				// moved content) — accept mode: render child runs as normal.
-				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, false); err != nil {
-					return p, err
-				}
-			case "del", "moveFrom":
-				// Tracked-change DELETION or move-from (the old location of
-				// moved content) — accept mode: drop entirely.
-				if err := decodeWrapper(dec, t, &p, paraRPr, pctx, true); err != nil {
+			case "ins", "moveTo", "del", "moveFrom":
+				// Tracked-change wrapper. Preserve the runs and tag them
+				// with the revision type — the renderer decides between
+				// accept mode (drop del/moveFrom) and show-revisions mode
+				// (strikethrough del, underline ins, etc.).
+				author := attr(t, "author")
+				if err := decodeWrapperWithRev(dec, t, &p, paraRPr, pctx, false, t.Name.Local, author); err != nil {
 					return p, err
 				}
 			case "smartTag", "customXml":
@@ -2052,14 +2453,18 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 					return p, err
 				}
 			case "oMath":
-				// Inline math equation. Best-effort: pull the visible text
-				// out of the subtree and emit it as one italic run.
-				txt, err := extractMathText(dec, t)
+				// Inline math equation. Pull the structural tree AND a
+				// textual approximation: the renderer paints the tree as
+				// 2D when possible and falls back to the string for
+				// search / accessibility.
+				tree, txt, err := ExtractMathTree(dec, t)
 				if err != nil {
 					return p, err
 				}
-				if txt != "" {
-					p.Runs = append(p.Runs, mathRun(txt, paraRPr))
+				if txt != "" || tree != nil {
+					run := mathRun(txt, paraRPr)
+					run.Math = tree
+					p.Runs = append(p.Runs, run)
 				}
 			case "fldSimple":
 				// The "simple" form of a field. Its `w:instr` attribute
@@ -2099,11 +2504,22 @@ func decodeParagraph(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCon
 // (tracked-changes), w:smartTag (auto-recognized text), w:customXml
 // (structured document tags). The wrapper itself has no rendering effect —
 // we recurse into its child runs (and nested wrappers) and append them to
-// the parent paragraph, except in "drop" mode (w:del) where we discard.
+// the parent paragraph, tagging each run with its tracked-change revision
+// type so the renderer can choose between accept-mode (drop dels) and
+// show-revisions mode (strikethrough dels, underline ins). The legacy
+// `drop` parameter remains as a hard parser-side suppression hook for
+// pathways that truly want the text gone (legacy callers); new code
+// should pass false and let the renderer decide.
 //
 // Bookmark text capture continues to work because pctx.bmActive is checked
 // for every emitted run regardless of nesting depth.
 func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr RunProps, pctx *parseDocContext, drop bool) error {
+	return decodeWrapperWithRev(dec, start, p, paraRPr, pctx, drop, "", "")
+}
+
+// decodeWrapperWithRev is decodeWrapper plus a revision tag that gets
+// stamped onto every emitted run.
+func decodeWrapperWithRev(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr RunProps, pctx *parseDocContext, drop bool, revType, revAuthor string) error {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -2119,6 +2535,14 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 				}
 				if drop {
 					continue
+				}
+				if revType != "" {
+					for i := range runs {
+						if runs[i].RevisionType == "" {
+							runs[i].RevisionType = revType
+							runs[i].RevisionAuthor = revAuthor
+						}
+					}
 				}
 				p.Runs = append(p.Runs, runs...)
 				// Bookmark capture: same logic as decodeParagraph's r branch,
@@ -2143,11 +2567,18 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 					return err
 				}
 			case "ins", "moveTo", "del", "moveFrom", "smartTag", "customXml":
-				// Nested wrappers: a delete-flavored wrapper inside an
-				// insert-flavored one still drops; parent wins via the drop
-				// flag (Word's "accept all" semantics).
-				childDrop := drop || t.Name.Local == "del" || t.Name.Local == "moveFrom"
-				if err := decodeWrapper(dec, t, p, paraRPr, pctx, childDrop); err != nil {
+				// Nested tracked-change wrappers: the innermost wrapper's
+				// type wins (so a `del` inside an `ins` reads as a del run,
+				// matching Word's "show revisions" intent). smartTag and
+				// customXml don't carry revision semantics.
+				childRev := revType
+				childAuthor := revAuthor
+				switch t.Name.Local {
+				case "ins", "moveTo", "del", "moveFrom":
+					childRev = t.Name.Local
+					childAuthor = attr(t, "author")
+				}
+				if err := decodeWrapperWithRev(dec, t, p, paraRPr, pctx, drop, childRev, childAuthor); err != nil {
 					return err
 				}
 			case "sdt":
@@ -2157,14 +2588,16 @@ func decodeWrapper(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraR
 					return err
 				}
 			case "oMath":
-				txt, err := extractMathText(dec, t)
+				tree, txt, err := ExtractMathTree(dec, t)
 				if err != nil {
 					return err
 				}
-				if drop || txt == "" {
+				if drop || (txt == "" && tree == nil) {
 					continue
 				}
-				p.Runs = append(p.Runs, mathRun(txt, paraRPr))
+				run := mathRun(txt, paraRPr)
+				run.Math = tree
+				p.Runs = append(p.Runs, run)
 			case "fldSimple":
 				if drop {
 					_ = dec.Skip()
@@ -2304,6 +2737,15 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 					p.StyleID = styleID
 					if st, ok := doc.Styles[styleID]; ok {
 						*paraRPr = MergeRunProps(*paraRPr, st.Run)
+						// Linked character style: a paragraph style with
+						// w:link should also apply its linked rPr so
+						// "Heading 1 Char" defaults flow through when
+						// the doc applies Heading 1 to a paragraph.
+						if st.LinkedCharStyle != "" {
+							if cs, ok := doc.CharStyles[st.LinkedCharStyle]; ok {
+								*paraRPr = MergeRunProps(*paraRPr, cs)
+							}
+						}
 						if st.HasAlignment {
 							p.Alignment = st.Alignment
 						}
@@ -2539,6 +2981,16 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 				// paragraph would inherit it — e.g. a bold pilcrow
 				// would faux-bold the body text. Skip the subtree.
 				_ = dec.Skip()
+			case "pPrChange":
+				// Tracked property change: holds the OLD pPr before the
+				// user changed it. Accept-changes semantics = ignore the
+				// inner pPr (it's history-only) — but expose the change
+				// marker so the renderer can paint a margin change bar
+				// when ShowRevisions is on.
+				if p != nil {
+					p.PrChange = readPrChangeAttrs(t, "pPr")
+				}
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -2555,6 +3007,7 @@ func decodePPr(dec *xml.Decoder, start xml.StartElement, p *Paragraph, paraRPr *
 func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *Document) ([]Run, error) {
 	rp := paraRPr
 	var atoms []Run
+	var rPrChange *PrChange
 
 	for {
 		tok, err := dec.Token()
@@ -2577,6 +3030,9 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					if sp, ok := doc.CharStyles[rp.StyleID]; ok {
 						rp = MergeRunProps(sp, rp)
 					}
+				}
+				if r.RPrChange != nil {
+					rPrChange = r.RPrChange.toPrChange("rPr")
 				}
 			case "t":
 				// xml:space="preserve" matters; encoding/xml preserves it for us.
@@ -2624,6 +3080,35 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					})
 				}
 				_ = dec.Skip()
+			case "footnoteRef", "endnoteRef":
+				// Auto-number marker inside a footnote/endnote body that
+				// represents "insert the current note's id here". The
+				// runtime ID isn't known at parse time; mark with a
+				// placeholder run that decodeNoteBody can substitute, or
+				// fall back to rendering with the note id from rels
+				// context. We emit a sentinel that the renderer treats as
+				// the note's own id when it later wraps the body.
+				srp := rp
+				srp.VertAlign = "superscript"
+				atoms = append(atoms, Run{Text: "​", Props: srp, FootnoteID: ""})
+				_ = dec.Skip()
+			case "annotationRef":
+				// Reviewer-comment auto-number marker (similar to
+				// footnoteRef but for comments). Surface a thin space so
+				// the marker doesn't widen the line — the comments
+				// section already includes its own id label.
+				atoms = append(atoms, Run{Text: "​", Props: rp})
+				_ = dec.Skip()
+			case "separator":
+				// Footnote separator marker — Word renders a horizontal
+				// rule. We don't know we're inside a footnote body here,
+				// but emit a U+23AF (HORIZONTAL LINE EXTENSION) glyph as a
+				// best-effort visual placeholder.
+				atoms = append(atoms, Run{Text: "⎯", Props: rp})
+				_ = dec.Skip()
+			case "continuationSeparator":
+				atoms = append(atoms, Run{Text: "⎯⎯", Props: rp})
+				_ = dec.Skip()
 			case "sym":
 				// <w:sym w:font="Wingdings" w:char="F0E0"/> — code point in the
 				// referenced font. Best-effort: convert the hex code to a rune
@@ -2637,15 +3122,30 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 				_ = dec.Skip()
 			case "fldChar":
-				switch attr(t, "fldCharType") {
+				fldType := attr(t, "fldCharType")
+				// A "begin" fldChar may carry a nested w:ffData (legacy
+				// form fields: FORMTEXT / FORMCHECKBOX / FORMDROPDOWN).
+				// Capture that state alongside the marker run so the
+				// renderer can synthesize visible glyphs when Word didn't
+				// cache a result.
+				var ff *FormFieldInfo
+				if fldType == "begin" {
+					ff = scanFFData(dec, t)
+				} else {
+					_ = dec.Skip()
+				}
+				switch fldType {
 				case "begin":
-					atoms = append(atoms, Run{FieldBegin: true, Props: rp})
+					r := Run{FieldBegin: true, Props: rp}
+					if ff != nil {
+						r.FormField = ff
+					}
+					atoms = append(atoms, r)
 				case "separate":
 					atoms = append(atoms, Run{FieldSep: true, Props: rp})
 				case "end":
 					atoms = append(atoms, Run{FieldEnd: true, Props: rp})
 				}
-				_ = dec.Skip()
 			case "instrText":
 				var s string
 				if err := dec.DecodeElement(&s, &t); err != nil {
@@ -2653,7 +3153,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				}
 				atoms = append(atoms, Run{InstrText: s, Props: rp})
 			case "drawing":
-				di, err := findDrawingInfo(dec, t)
+				di, err := findDrawingInfo(dec, t, doc)
 				if err != nil {
 					return nil, err
 				}
@@ -2666,65 +3166,156 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						CropBottomPct:   di.CropB,
 						CropLeftPct:     di.CropL,
 						CropRightPct:    di.CropR,
+						ImageEffects:    di.ImageEffects,
 						ImageAnchored:   di.IsAnchor,
 						AnchorAlignH:    di.PosH.Align,
 						AnchorAlignV:    di.PosV.Align,
 						AnchorOffsetXPt: di.PosH.OffsetPt(),
 						AnchorOffsetYPt: di.PosV.OffsetPt(),
 						AnchorWrap:      di.WrapType,
+						AltText:         di.AltText,
 						Props:           rp,
 					})
+				} else if di.ShapePrst != "" || di.CustPath != "" {
+					// DrawingML vector shape (no image). Synthesize a
+					// VMLShape so the renderer's shape path draws it.
+					sh := &VMLShape{
+						Kind:           shapeKindForPrst(di.ShapePrst),
+						WidthPt:        di.WPt,
+						HeightPt:       di.HPt,
+						FillColor:      di.ShapeFill,
+						StrokeColor:    di.ShapeStroke,
+						StrokeWeightPt: di.ShapeStrokeWeightPt,
+						CustomPath:     di.CustPath,
+						GradientKind:   di.ShapeGradientKind,
+						GradientAngle:  di.ShapeGradientAngle,
+						GradientStops:  di.ShapeGradientStops,
+						Shadow:         di.ShapeShadow,
+						Pattern:        di.ShapePattern,
+						TextBox:        di.TxbxText,
+						TextBoxBlocks:  di.TxbxBlocks,
+					}
+					if sh.WidthPt <= 0 {
+						sh.WidthPt = 96
+					}
+					if sh.HeightPt <= 0 {
+						sh.HeightPt = 48
+					}
+					atoms = append(atoms, Run{VMLShape: sh, AltText: di.AltText, Props: rp})
+					// Done — text-box content is carried by the shape
+					// itself, no separate inline italic dump needed.
+					di.TxbxText = ""
 				}
-				// Text-box body (wps:txbx) accompanies any image content
-				// the drawing also has — both can coexist on one shape.
-				// Inline-emit as italic so the reader can distinguish
-				// box content from surrounding flow text.
+				// Text-box body (wps:txbx) on a drawing that's NOT a
+				// vector shape (image-only or empty drawing). Inline-
+				// emit as italic so the reader can distinguish box
+				// content from surrounding flow text.
 				if di.TxbxText != "" {
 					trp := rp
 					trp.Italic = true
 					atoms = append(atoms, Run{Text: di.TxbxText, Props: trp})
 				}
-				// Chart reference: surface the pre-extracted labels so
-				// the reader sees what the chart said. If the chart part
-				// wasn't loadable we still emit a "[Chart]" placeholder.
+				// Chart reference: paint a rectangular placeholder
+				// where the chart would sit, then surface the
+				// pre-extracted labels next to it. Pixel-accurate
+				// chart drawing (bars, slices, axes) would require
+				// parsing the c:ser/c:val data — best-effort here is
+				// the labeled rect so the reader sees the chart's
+				// dimensions plus its title/data prose.
 				if di.ChartRID != "" {
-					trp := rp
-					trp.Italic = true
 					txt := doc.Charts[di.ChartRID]
-					if txt == "" {
-						txt = "[Chart]"
-					} else {
-						txt = "[Chart: " + txt + "]"
+					sh := &VMLShape{
+						Kind:           "rect",
+						WidthPt:        di.WPt,
+						HeightPt:       di.HPt,
+						StrokeColor:    "808080",
+						StrokeWeightPt: 0.5,
+						TextBox:        "Chart",
 					}
-					atoms = append(atoms, Run{Text: txt, Props: trp})
+					if sh.WidthPt <= 0 {
+						sh.WidthPt = 240
+					}
+					if sh.HeightPt <= 0 {
+						sh.HeightPt = 160
+					}
+					// Prefer the structured chart data when available so
+					// the renderer can paint real bars/pies. The text
+					// dump stays as the placeholder label.
+					if cd, ok := doc.ChartsData[di.ChartRID]; ok {
+						sh.Chart = &cd
+						sh.TextBox = "" // chart renderer paints its own labels
+					} else if txt != "" {
+						sh.TextBox = "Chart: " + truncateText(txt, 80)
+					}
+					atoms = append(atoms, Run{VMLShape: sh, Props: rp})
+					if sh.Chart == nil && txt != "" {
+						// Fallback: dump the chart's text content inline
+						// so prose around the chart still makes sense.
+						trp := rp
+						trp.Italic = true
+						atoms = append(atoms, Run{Text: "[Chart: " + txt + "]", Props: trp})
+					}
 				}
-				// SmartArt diagram reference: surface the node-text
-				// graph so the diagram's conceptual content survives
-				// in the PDF text stream. Visual layout requires
-				// running the diagram algorithm against the layout /
-				// quickStyle / colors parts — out of scope.
+				// SmartArt diagram reference: paint a labeled box for
+				// the visual footprint and surface the node-text graph
+				// as italic prose so the conceptual content survives.
+				// Full diagram layout requires running the layout/colors/
+				// quickStyle algorithm — out of scope.
 				if di.DiagramRID != "" {
-					trp := rp
-					trp.Italic = true
 					txt := doc.Diagrams[di.DiagramRID]
-					if txt == "" {
-						txt = "[Diagram]"
+					// When the SmartArt drawing part was pre-rendered by
+					// Word, use that whole group as the shape — every
+					// node renders as a real geometric box with its
+					// caption. Otherwise synthesize a minimal process
+					// layout from the node-text list so a diagram still
+					// shows up as boxes-with-arrows rather than a single
+					// gray placeholder rect.
+					var sh *VMLShape
+					if drew := doc.DiagramShapes[di.DiagramRID]; drew != nil {
+						scaled := *drew
+						scaled.WidthPt = di.WPt
+						scaled.HeightPt = di.HPt
+						if scaled.WidthPt <= 0 {
+							scaled.WidthPt = 320
+						}
+						if scaled.HeightPt <= 0 {
+							scaled.HeightPt = 200
+						}
+						sh = &scaled
+					} else if synth := synthesizeSmartArtLayout(txt, di.WPt, di.HPt); synth != nil {
+						sh = synth
 					} else {
-						txt = "[Diagram: " + txt + "]"
+						sh = &VMLShape{
+							Kind:           "rect",
+							WidthPt:        di.WPt,
+							HeightPt:       di.HPt,
+							StrokeColor:    "B0B0B0",
+							StrokeWeightPt: 0.5,
+							TextBox:        "SmartArt",
+						}
+						if sh.WidthPt <= 0 {
+							sh.WidthPt = 240
+						}
+						if sh.HeightPt <= 0 {
+							sh.HeightPt = 160
+						}
 					}
-					atoms = append(atoms, Run{Text: txt, Props: trp})
+					atoms = append(atoms, Run{VMLShape: sh, Props: rp})
+					if doc.DiagramShapes[di.DiagramRID] == nil && sh.Kind != "group" && txt != "" {
+						trp := rp
+						trp.Italic = true
+						atoms = append(atoms, Run{Text: "[Diagram: " + txt + "]", Props: trp})
+					}
 				}
 			case "pict":
 				// Legacy VML images: <w:pict><v:shape style="..."><v:imagedata r:id="..."/>
 				// </v:shape></w:pict>. Older Word docs, Excel/Outlook pastes, and
 				// some converters still emit these instead of w:drawing.
-				vi, err := findPictInfo(dec, t)
+				vi, err := findPictInfo(dec, t, doc)
 				if err != nil {
 					return nil, err
 				}
 				if vi.IsHR {
-					// HTML/markdown <hr> separator. Renderer turns this
-					// into a horizontal line at the paragraph's position.
 					atoms = append(atoms, Run{HorizontalRule: true, Props: rp})
 				} else if vi.RID != "" {
 					atoms = append(atoms, Run{
@@ -2733,6 +3324,8 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 						ImageHeightPt: vi.HPt,
 						Props:         rp,
 					})
+				} else if vi.Shape != nil {
+					atoms = append(atoms, Run{VMLShape: vi.Shape, Props: rp})
 				}
 			case "AlternateContent":
 				// Markup Compatibility wrapper: prefer mc:Choice over
@@ -2745,23 +3338,166 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 				atoms = append(atoms, runs...)
 			case "object":
 				// w:object wraps OLE/embedded content (Excel range, Visio,
-				// chart, equation, ...). We can't render the foreign payload,
-				// but emitting a marker run beats silently dropping it — at
-				// least the reader sees "something was here".
-				atoms = append(atoms, Run{
-					Text:  "[Embedded object]",
-					Props: rp,
-				})
+				// chart, equation, ...). Word usually pairs the OLE blob
+				// with a v:imagedata preview. Order of preference for the
+				// output:
+				//   1. Decoded Excel grid (rendered as a small table).
+				//   2. The preview image / VML shape.
+				//   3. "[Embedded object]" textual placeholder.
+				vi, err := findPictInfo(dec, t, doc)
+				if err != nil {
+					return nil, err
+				}
+				if vi.OLEObjectRID != "" && doc != nil {
+					if xl, ok := doc.OLEEmbeds[vi.OLEObjectRID]; ok && len(xl.Cells) > 0 {
+						// Emit the grid as a text run so it lives inside
+						// the paragraph; a real Table block would require
+						// closing the current paragraph, which we cannot
+						// safely do from here.
+						txt := flattenExcelGrid(xl)
+						atoms = append(atoms, Run{Text: txt, Props: rp})
+						continue
+					}
+				}
+				switch {
+				case vi.RID != "":
+					atoms = append(atoms, Run{
+						ImageID:       vi.RID,
+						ImageWidthPt:  vi.WPt,
+						ImageHeightPt: vi.HPt,
+						Props:         rp,
+					})
+				case vi.Shape != nil:
+					atoms = append(atoms, Run{VMLShape: vi.Shape, Props: rp})
+				default:
+					atoms = append(atoms, Run{Text: "[Embedded object]", Props: rp})
+				}
+			case "ruby":
+				ruby, base, err := decodeRuby(dec, t)
+				if err != nil {
+					return nil, err
+				}
+				if base != "" {
+					atoms = append(atoms, Run{Text: base, Ruby: &ruby, Props: rp})
+				}
+			case "contentPart":
+				// w14:ink — we can't rasterize the stroke data, emit a
+				// placeholder so the marker isn't lost.
+				atoms = append(atoms, Run{Text: "[Ink]", InkPlaceholder: true, Props: rp})
 				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
+				if rPrChange != nil {
+					for i := range atoms {
+						if atoms[i].PrChange == nil {
+							atoms[i].PrChange = rPrChange
+						}
+					}
+				}
 				return atoms, nil
 			}
 		}
 	}
+}
+
+// decodeRuby parses a <w:ruby> element. Returns the ruby annotation
+// info and the base text it decorates.
+func decodeRuby(dec *xml.Decoder, start xml.StartElement) (RubyInfo, string, error) {
+	var ri RubyInfo
+	var base, rt string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ri, "", err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "rubyPr":
+				if err := decodeRubyPr(dec, t, &ri); err != nil {
+					return ri, "", err
+				}
+			case "rt":
+				rt = drainRunsForText(dec, t)
+			case "rubyBase":
+				base = drainRunsForText(dec, t)
+			default:
+				_ = dec.Skip()
+			}
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				ri.Text = rt
+				return ri, base, nil
+			}
+		}
+	}
+}
+
+func decodeRubyPr(dec *xml.Decoder, start xml.StartElement, ri *RubyInfo) error {
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			switch t.Name.Local {
+			case "rubyAlign":
+				ri.Align = attr(t, "val")
+			case "hps":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.ParseFloat(v, 64); err == nil {
+						ri.Hps = x
+					}
+				}
+			case "hpsRaise":
+				if v := attr(t, "val"); v != "" {
+					if x, err := strconv.ParseFloat(v, 64); err == nil {
+						ri.HpsRaise = x
+					}
+				}
+			case "lid":
+				ri.LangAttr = attr(t, "val")
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return nil
+}
+
+func drainRunsForText(dec *xml.Decoder, start xml.StartElement) string {
+	var b strings.Builder
+	depth := 1
+	inT := false
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return b.String()
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if t.Name.Local == "t" {
+				inT = true
+			}
+		case xml.EndElement:
+			if t.Name.Local == "t" {
+				inT = false
+			}
+			depth--
+		case xml.CharData:
+			if inT {
+				b.Write(t)
+			}
+		}
+	}
+	return b.String()
 }
 
 // drawingInfo captures everything we need from a w:drawing subtree: rId,
@@ -2775,6 +3511,11 @@ type drawingInfo struct {
 	// if present. Best-effort: structural formatting inside the text box
 	// is lost. Empty when the drawing is an image-only or shape-only.
 	TxbxText string
+	// TxbxBlocks is the structured paragraph/table tree inside the same
+	// w:txbxContent. Populated by extractTxbxRich so the renderer can
+	// draw rich content (lists, bold runs, nested tables) instead of a
+	// single flat string.
+	TxbxBlocks []Block
 	// ChartRID is set when the drawing references a chart part via
 	// <c:chart r:id="…">. The renderer looks up Document.Charts[ChartRID]
 	// to surface chart labels as plain text. Empty for non-chart drawings.
@@ -2794,6 +3535,48 @@ type drawingInfo struct {
 	// element), "square", "tight", "through", "topAndBottom", "behind",
 	// "inFront".
 	WrapType string
+	// AltText comes from wp:docPr's w:descr / w:title attributes —
+	// accessibility metadata for tagged PDFs.
+	AltText string
+	// ShapePrst is the DrawingML <a:prstGeom prst="…"> preset name when
+	// the drawing is a vector shape rather than an image.
+	ShapePrst string
+	// ShapeFill / ShapeStroke / ShapeStrokeWeightPt are scraped from
+	// <a:spPr><a:solidFill>/<a:ln>.
+	ShapeFill          string
+	ShapeStroke        string
+	ShapeStrokeWeightPt float64
+	// ShapeGradientKind / ShapeGradientAngle / ShapeGradientStops capture
+	// <a:gradFill> when the shape uses a gradient instead of solid fill.
+	ShapeGradientKind  string
+	ShapeGradientAngle float64
+	ShapeGradientStops []GradientStop
+	// ShapeShadow captures <a:effectLst><a:outerShdw>.
+	ShapeShadow *ShadowEffect
+	// ShapeInnerShadow captures <a:effectLst><a:innerShdw>.
+	ShapeInnerShadow *ShadowEffect
+	// ShapeGlow captures <a:effectLst><a:glow> — halo around the edge.
+	ShapeGlow *GlowEffect
+	// ShapeReflection captures <a:effectLst><a:reflection> — mirror below.
+	ShapeReflection *ReflectionEffect
+	// ShapeSoftEdgePt captures <a:effectLst><a:softEdge rad="…"/> — gaussian
+	// edge softening radius in points. The renderer approximates this by
+	// drawing a thin lighter outline.
+	ShapeSoftEdgePt float64
+	// ShapePattern captures <a:pattFill prst="…"> when present. Renderer
+	// can use the preset to tile a real pattern; falls back to ShapeFill
+	// when nil.
+	ShapePattern *PatternFill
+	// CustPath is the flattened path list when the shape declares
+	// <a:custGeom><a:pathLst>. Uses simple m/l/c/q/z + numeric tokens.
+	CustPath string
+	// OLEPreviewRID is the relationship id of the preview image inside a
+	// w:object/o:OLEObject — extracted from the nested v:imagedata r:id
+	// when w:object wraps embedded content.
+	OLEPreviewRID string
+	// ImageEffects lists per-pixel filters captured from <a:blip>'s effect
+	// children (alphaModFix / lum / biLevel / duotone / grayscl / blur).
+	ImageEffects []ImageEffect
 }
 
 // DrawingPos mirrors wp:positionH / wp:positionV — either an absolute
@@ -2817,7 +3600,11 @@ const emuPerPt = 12700.0
 
 // findDrawingInfo walks a w:drawing subtree and pulls out the drawing info.
 // srcRect: each side is in 1/1000ths of a percent (so 10000 = 10%).
-func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo, err error) {
+//
+// doc, when non-nil, is used to fully parse rich text inside w:txbxContent
+// (paragraphs / tables / lists, including formatting). When nil the parser
+// still records the flattened text into info.TxbxText.
+func findDrawingInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info drawingInfo, err error) {
 	depth := 1
 	// Position-decoding context: when we're inside a positionH / positionV
 	// element we capture children into the appropriate DrawingPos.
@@ -2869,12 +3656,115 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 				info.WrapType = "through"
 			case "wrapTopAndBottom":
 				info.WrapType = "topAndBottom"
+			case "docPr":
+				// wp:docPr w:descr / w:title — accessibility alt text.
+				if v := attr(t, "descr"); v != "" {
+					info.AltText = v
+				} else if v := attr(t, "title"); v != "" {
+					info.AltText = v
+				}
+			case "prstGeom":
+				if v := attr(t, "prst"); v != "" {
+					info.ShapePrst = v
+				}
+			case "custGeom":
+				// Scoop the custGeom path tokens as a flat string the
+				// renderer can parse. We don't try to honor avLst /
+				// gdLst — those drive parametric overrides we don't model.
+				p, err := flattenCustGeomPath(dec, t)
+				if err != nil {
+					return info, err
+				}
+				info.CustPath = p
+				depth--
+			case "solidFill":
+				// Best-effort scrape: first color leaf wins. schemeClr is
+				// resolved against doc.Theme; modifier chain (lumMod/tint/
+				// shade/etc.) applied.
+				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" {
+					if info.ShapeFill == "" {
+						info.ShapeFill = c
+					}
+				}
+				depth--
+			case "gradFill":
+				stops, angle, kind, err := parseGradFillTheme(dec, t, themeFor(doc))
+				if err != nil {
+					return info, err
+				}
+				depth--
+				if len(stops) > 0 && info.ShapeGradientKind == "" {
+					info.ShapeGradientKind = kind
+					info.ShapeGradientAngle = angle
+					info.ShapeGradientStops = stops
+				}
+			case "pattFill":
+				// Pattern fills — we now record the preset name so the
+				// renderer can tile a real pattern. Fallback color is
+				// recorded for renderers that don't know the preset.
+				fillSpec, err := parsePattFillSpec(dec, t, themeFor(doc))
+				if err != nil {
+					return info, err
+				}
+				depth--
+				if fillSpec.AvgColor != "" && info.ShapeFill == "" {
+					info.ShapeFill = fillSpec.AvgColor
+				}
+				if info.ShapePattern == nil && fillSpec.Preset != "" {
+					info.ShapePattern = &PatternFill{
+						Preset: fillSpec.Preset,
+						FgHex:  fillSpec.FgHex,
+						BgHex:  fillSpec.BgHex,
+					}
+				}
+			case "effectLst":
+				effs, err := parseEffectListExt(dec, t, themeFor(doc))
+				if err != nil {
+					return info, err
+				}
+				depth--
+				if effs.Shadow != nil && info.ShapeShadow == nil {
+					info.ShapeShadow = effs.Shadow
+				}
+				if effs.Glow != nil && info.ShapeGlow == nil {
+					info.ShapeGlow = effs.Glow
+				}
+				if effs.Reflection != nil && info.ShapeReflection == nil {
+					info.ShapeReflection = effs.Reflection
+				}
+				if effs.SoftEdgePt > 0 && info.ShapeSoftEdgePt == 0 {
+					info.ShapeSoftEdgePt = effs.SoftEdgePt
+				}
+				if effs.InnerShadow != nil && info.ShapeInnerShadow == nil {
+					info.ShapeInnerShadow = effs.InnerShadow
+				}
+			case "ln":
+				// DrawingML <a:ln w="…"> line weight (in EMU). Scrape
+				// stroke color from nested solidFill (theme-aware).
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
+						info.ShapeStrokeWeightPt = float64(x) / emuPerPt
+					}
+				}
+				if c := scanSolidFillColorTheme(dec, t, themeFor(doc)); c != "" {
+					info.ShapeStroke = c
+				}
+				depth--
 			case "blip":
 				for _, a := range t.Attr {
 					if a.Name.Local == "embed" {
 						info.RID = a.Value
 					}
 				}
+				// Drain a:blip's effect children (alphaModFix / lum / biLevel /
+				// duotone / clrChange / grayscl / blur). Word writes them as
+				// peer elements inside <a:blip>; we collect them so the
+				// renderer can post-process the raster.
+				effs := parseBlipEffects(dec, t, themeFor(doc))
+				if len(effs) > 0 {
+					info.ImageEffects = append(info.ImageEffects, effs...)
+				}
+				depth--
 			case "extent":
 				for _, a := range t.Attr {
 					switch a.Name.Local {
@@ -2925,18 +3815,17 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 					}
 				}
 			case "txbxContent":
-				// Word text-box body. Real txbxContent holds a tree of
-				// w:p/w:r/w:t; we pull out the visible text with a single
-				// CharData sweep so the content survives even though
-				// internal formatting (bold, lists, tables-in-textboxes)
-				// is lost. Whitespace between paragraphs collapses; a
-				// single space is inserted to keep adjacent words apart.
-				txt, err := extractTxbxText(dec, t)
+				// Word text-box body. The rich extractor parses the
+				// full paragraph/table tree (so bold runs, bullets, and
+				// nested tables survive) while also producing a flat
+				// fallback string for callers that only need plain text.
+				txt, blocks, err := extractTxbxRich(dec, t, doc)
 				if err != nil {
 					return info, err
 				}
 				info.TxbxText = txt
-				// extractTxbxText consumed the matching EndElement, so
+				info.TxbxBlocks = blocks
+				// extractTxbxRich consumed the matching EndElement, so
 				// undo the +1 we did at the top of this StartElement
 				// branch — otherwise depth never returns to 0.
 				depth--
@@ -2950,6 +3839,322 @@ func findDrawingInfo(dec *xml.Decoder, start xml.StartElement) (info drawingInfo
 		}
 	}
 	return info, nil
+}
+
+// scanFFData walks the children of an <w:fldChar w:fldCharType="begin">
+// looking for a <w:ffData> sub-element. Returns nil if none found.
+// Consumes up to and including the fldChar EndElement.
+func scanFFData(dec *xml.Decoder, start xml.StartElement) *FormFieldInfo {
+	var ff *FormFieldInfo
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return ff
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			switch t.Name.Local {
+			case "ffData":
+				if ff == nil {
+					ff = &FormFieldInfo{}
+				}
+			case "name":
+				if ff != nil {
+					ff.Name = attr(t, "val")
+				}
+			case "textInput":
+				if ff != nil {
+					ff.Kind = "text"
+				}
+			case "checkBox":
+				if ff != nil {
+					ff.Kind = "checkbox"
+				}
+			case "ddList":
+				if ff != nil {
+					ff.Kind = "dropdown"
+				}
+			case "default":
+				if ff != nil {
+					v := attr(t, "val")
+					switch ff.Kind {
+					case "text":
+						ff.Default = v
+					case "checkbox":
+						switch v {
+						case "1", "true", "on":
+							ff.Checked = true
+						}
+					case "dropdown":
+						if x, err := strconv.Atoi(v); err == nil {
+							ff.Selected = x
+						}
+					}
+				}
+			case "checked":
+				if ff != nil && ff.Kind == "checkbox" {
+					v := attr(t, "val")
+					switch v {
+					case "", "1", "true", "on":
+						ff.Checked = true
+					}
+				}
+			case "result":
+				if ff != nil && ff.Kind == "dropdown" {
+					v := attr(t, "val")
+					if x, err := strconv.Atoi(v); err == nil {
+						ff.Selected = x
+					}
+				}
+			case "listEntry":
+				if ff != nil && ff.Kind == "dropdown" {
+					ff.Choices = append(ff.Choices, attr(t, "val"))
+				}
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return ff
+}
+
+// truncateText returns s clipped to maxRunes runes followed by an ellipsis.
+func truncateText(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "…"
+}
+
+// shapeKindForPrst maps a DrawingML prstGeom preset to our VMLShape.Kind
+// taxonomy. Unrecognized names route to "rect" so the renderer still
+// draws SOMETHING in the right place.
+func shapeKindForPrst(prst string) string {
+	switch prst {
+	case "rect":
+		return "rect"
+	case "roundRect", "round1Rect", "round2DiagRect", "round2SameRect":
+		return "roundrect"
+	case "ellipse":
+		return "oval"
+	case "line", "straightConnector1":
+		return "line"
+	case "triangle":
+		return "triangle"
+	case "rtTriangle":
+		return "rtTriangle"
+	case "parallelogram":
+		return "parallelogram"
+	case "trapezoid":
+		return "trapezoid"
+	case "diamond":
+		return "diamond"
+	case "pentagon":
+		return "pentagon"
+	case "hexagon":
+		return "hexagon"
+	case "heptagon":
+		return "heptagon"
+	case "octagon":
+		return "octagon"
+	case "star4":
+		return "star4"
+	case "star5":
+		return "star5"
+	case "star6":
+		return "star6"
+	case "star7":
+		return "star7"
+	case "star8":
+		return "star8"
+	case "star10":
+		return "star10"
+	case "star12":
+		return "star12"
+	case "star16":
+		return "star16"
+	case "star24":
+		return "star24"
+	case "star32":
+		return "star32"
+	case "rightArrow":
+		return "rightArrow"
+	case "leftArrow":
+		return "leftArrow"
+	case "upArrow":
+		return "upArrow"
+	case "downArrow":
+		return "downArrow"
+	case "leftRightArrow":
+		return "leftRightArrow"
+	case "upDownArrow":
+		return "upDownArrow"
+	case "bentArrow":
+		return "bentArrow"
+	case "callout1", "callout2", "callout3", "borderCallout1", "borderCallout2", "borderCallout3":
+		return "callout"
+	case "wedgeRectCallout":
+		return "calloutRect"
+	case "wedgeRoundRectCallout":
+		return "calloutRoundRect"
+	case "wedgeEllipseCallout":
+		return "calloutEllipse"
+	case "plus":
+		return "plus"
+	case "minus":
+		return "minus"
+	case "cloud":
+		return "cloud"
+	case "heart":
+		return "heart"
+	case "smileyFace":
+		return "smiley"
+	case "moon":
+		return "moon"
+	case "sun":
+		return "sun"
+	case "lightningBolt":
+		return "lightning"
+	case "noSmoking":
+		return "noEntry"
+	case "donut":
+		return "donut"
+	case "chevron":
+		return "chevron"
+	case "homePlate":
+		return "homePlate"
+	case "can":
+		return "can"
+	case "cube":
+		return "cube"
+	}
+	if prst != "" {
+		// Unknown but explicitly named — surface as a named primitive so
+		// the renderer can decide. Defaults to rect outline.
+		return "prst:" + prst
+	}
+	return "rect"
+}
+
+// scanSolidFillColor walks the children of an <a:solidFill> / <a:ln>
+// looking for a color leaf and returns its hex value without the leading
+// '#'. Recognizes a:srgbClr (direct hex), a:schemeClr (theme slot — only
+// resolves to "" because callers without theme can't bind it), a:sysClr
+// (lastClr), and a:prstClr. For schemeClr resolution use
+// scanSolidFillColorTheme. Returns "" if no color found.
+func scanSolidFillColor(dec *xml.Decoder, start xml.StartElement) string {
+	return scanSolidFillColorTheme(dec, start, Theme{})
+}
+
+// scanSolidFillColorTheme is the theme-aware variant that resolves
+// a:schemeClr against theme.Colors and applies any modifier chain
+// (lumMod/lumOff/satMod/satOff/tint/shade) that sits under the color leaf.
+func scanSolidFillColorTheme(dec *xml.Decoder, start xml.StartElement, theme Theme) string {
+	return ScanColor(dec, start, theme)
+}
+
+// flattenCustGeomPath walks an <a:custGeom>/<a:pathLst>/<a:path> subtree
+// and returns a compact token string: "M x y L x y C x1 y1 x2 y2 x3 y3 Z".
+// All coordinates are EMU-relative to the shape's <a:path @w @h> bounding
+// box; the renderer normalizes to local 0..1 space at draw time.
+func flattenCustGeomPath(dec *xml.Decoder, start xml.StartElement) (string, error) {
+	var pathW, pathH int64
+	var b strings.Builder
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return b.String(), err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			switch t.Name.Local {
+			case "path":
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
+						pathW = x
+					}
+				}
+				if v := attr(t, "h"); v != "" {
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
+						pathH = x
+					}
+				}
+			case "moveTo":
+				appendPathCmd(dec, t, &b, "M", 1, pathW, pathH)
+				depth--
+			case "lnTo":
+				appendPathCmd(dec, t, &b, "L", 1, pathW, pathH)
+				depth--
+			case "cubicBezTo":
+				appendPathCmd(dec, t, &b, "C", 3, pathW, pathH)
+				depth--
+			case "quadBezTo":
+				appendPathCmd(dec, t, &b, "Q", 2, pathW, pathH)
+				depth--
+			case "close":
+				if b.Len() > 0 {
+					b.WriteByte(' ')
+				}
+				b.WriteString("Z")
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	return b.String(), nil
+}
+
+// appendPathCmd consumes a path command subtree (moveTo/lnTo/...) and
+// appends "<cmd> x y …" to b, normalizing each point to the 0..1 range
+// against the path's declared w/h.
+func appendPathCmd(dec *xml.Decoder, start xml.StartElement, b *strings.Builder, cmd string, points int, pathW, pathH int64) {
+	pts := make([]string, 0, points*2)
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if t.Name.Local == "pt" {
+				normalize := func(name string, denom int64) string {
+					v := attr(t, name)
+					if v == "" {
+						return "0"
+					}
+					if denom <= 0 {
+						return v
+					}
+					if x, err := strconv.ParseInt(v, 10, 64); err == nil {
+						return strconv.FormatFloat(float64(x)/float64(denom), 'f', 4, 64)
+					}
+					return v
+				}
+				pts = append(pts, normalize("x", pathW))
+				pts = append(pts, normalize("y", pathH))
+			}
+		case xml.EndElement:
+			depth--
+		}
+	}
+	if b.Len() > 0 {
+		b.WriteByte(' ')
+	}
+	b.WriteString(cmd)
+	for _, p := range pts {
+		b.WriteByte(' ')
+		b.WriteString(p)
+	}
 }
 
 // readElementText returns the concatenated CharData inside the current
@@ -2976,12 +4181,58 @@ func readElementText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 	}
 }
 
+// extractTxbxRich parses a w:txbxContent subtree into a structured block
+// tree (paragraphs / tables, with full run formatting) and also returns
+// a flattened plain-text approximation for callers that only need the
+// inline fallback. Consumes up to and including the matching EndElement.
+//
+// When doc is nil the parser still walks the tree, but resolved styles
+// won't apply — block content is still produced because each paragraph
+// stands on its own data.
+func extractTxbxRich(dec *xml.Decoder, start xml.StartElement, doc *Document) (string, []Block, error) {
+	pctx := &parseDocContext{doc: doc}
+	if doc == nil {
+		// parseNoteBody calls into decoders that nil-check doc; the few
+		// that don't (style merges) will be no-ops without it.
+		pctx.doc = &Document{}
+	}
+	blocks, err := parseNoteBody(dec, start, pctx)
+	if err != nil {
+		return "", nil, err
+	}
+	// Flatten visible text from the parsed blocks so the legacy TextBox
+	// string fallback stays populated. Walk paragraphs in order; each
+	// paragraph contributes its run text joined with no separator and
+	// paragraphs are separated by a single space.
+	var sb strings.Builder
+	var walk func(bs []Block)
+	walk = func(bs []Block) {
+		for _, b := range bs {
+			switch v := b.(type) {
+			case Paragraph:
+				if sb.Len() > 0 {
+					sb.WriteByte(' ')
+				}
+				for _, run := range v.Runs {
+					if run.Text != "" && !run.FieldBegin && !run.FieldSep && !run.FieldEnd {
+						sb.WriteString(run.Text)
+					}
+				}
+			case Table:
+				for _, row := range v.Rows {
+					for _, cell := range row.Cells {
+						walk(cell.Blocks)
+					}
+				}
+			}
+		}
+	}
+	walk(blocks)
+	return strings.TrimSpace(sb.String()), blocks, nil
+}
+
 // extractTxbxText concatenates the visible text inside a w:txbxContent
-// subtree. We separate paragraphs with a single space rather than try to
-// preserve them as standalone Paragraph blocks — text-box content lives
-// inline at a run level in our model, and inline runs don't carry
-// paragraph breaks. Inserting whitespace between paragraphs keeps words
-// from being run together.
+// subtree. Kept for callers that only need the flat fallback.
 func extractTxbxText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 	var sb []byte
 	depth := 1
@@ -3011,17 +4262,26 @@ func extractTxbxText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 type pictInfo struct {
 	RID      string
 	WPt, HPt float64
-	// IsHR marks a "horizontal rule" pict: <v:rect o:hr="t">. Word writes
-	// these to represent HTML/markdown <hr> separators. No image data
-	// involved — the renderer just draws a horizontal line.
-	IsHR bool
+	IsHR     bool
+	Shape    *VMLShape
+	// OLEObjectRID, when non-empty, is the r:id of an embedded OLE object
+	// (Excel range, equation, Visio). The caller can look it up in the
+	// document's relationship map and dispatch to a specific reader (we
+	// currently extract Excel ranges to small text grids).
+	OLEObjectRID string
+	// OLEProgID is the o:OLEObject@ProgID attribute when present (e.g.
+	// "Excel.Sheet.12" / "Equation.3"). Used to dispatch the OLE blob to
+	// a type-specific reader.
+	OLEProgID string
 }
 
-// findPictInfo walks a w:pict subtree pulling out the embedded image rId
-// (from v:imagedata) and the shape's declared size (from v:shape's
-// CSS-style "style" attribute: width:1.5in;height:0.75in). Returns an
-// empty RID when no image reference is present — caller drops the run.
-func findPictInfo(dec *xml.Decoder, start xml.StartElement) (info pictInfo, err error) {
+// findPictInfo walks a w:pict subtree pulling out imagedata + shape info.
+// Now handles v:group by recursing into each child shape. The doc handle
+// is passed down so v:textbox can parse rich w:txbxContent.
+func findPictInfo(dec *xml.Decoder, start xml.StartElement, doc *Document) (info pictInfo, err error) {
+	// First, drain the immediate children: imagedata (RID) wins over shape;
+	// a single shape element captures the outermost VMLShape, including any
+	// nested group children.
 	depth := 1
 	for depth > 0 {
 		tok, e := dec.Token()
@@ -3030,41 +4290,231 @@ func findPictInfo(dec *xml.Decoder, start xml.StartElement) (info pictInfo, err 
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			depth++
 			switch t.Name.Local {
-			case "shape", "rect", "roundrect", "oval", "line":
-				// VML shape carrying the image. Parse style for size.
-				if style := attr(t, "style"); style != "" {
-					w, h := parseVMLSize(style)
-					if w > 0 {
-						info.WPt = w
-					}
-					if h > 0 {
-						info.HPt = h
-					}
-				}
-				// Office uses <v:rect o:hr="t"> (sometimes <v:line>) as
-				// the HTML/markdown <hr> separator. No imagedata is
-				// involved — flagging IsHR is the signal the renderer
-				// needs to draw a horizontal line.
-				if attr(t, "hr") == "t" {
+			case "shape", "rect", "roundrect", "oval", "line", "polyline", "group":
+				sh, hr, rid, wpt, hpt := decodeVMLShape(dec, t, doc)
+				if hr {
 					info.IsHR = true
 				}
+				if rid != "" && info.RID == "" {
+					info.RID = rid
+				}
+				if wpt > 0 {
+					info.WPt = wpt
+				}
+				if hpt > 0 {
+					info.HPt = hpt
+				}
+				if sh != nil && info.Shape == nil && info.RID == "" {
+					info.Shape = sh
+				}
+				continue
+			case "OLEObject", "objectLink", "objectEmbed":
+				// Inside w:object: <o:OLEObject r:id="…" ProgID="…"/>
+				// tells us the OLE blob's relationship id and its server
+				// program. Capture both so the caller can look up the
+				// embedded part and emit type-specific content (Excel
+				// range, equation, etc.).
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "id":
+						if info.OLEObjectRID == "" {
+							info.OLEObjectRID = a.Value
+						}
+					case "ProgID":
+						info.OLEProgID = a.Value
+					}
+				}
+				_ = dec.Skip()
+				continue
 			case "imagedata":
-				// r:id (or r:relid) references the image part. Accept either
-				// since some converters use relid.
+				// Bare imagedata directly under pict — uncommon but
+				// possible; capture rid.
 				for _, a := range t.Attr {
 					if a.Name.Local == "id" || a.Name.Local == "relid" {
 						info.RID = a.Value
 						break
 					}
 				}
+				_ = dec.Skip()
+				continue
 			}
+			depth++
 		case xml.EndElement:
 			depth--
 		}
 	}
 	return info, nil
+}
+
+// decodeVMLShape parses a single VML shape element subtree (recursively
+// for v:group). Returns the constructed shape (nil if it was a pure
+// imagedata), an isHorizontalRule flag, a captured imagedata RID, and
+// the shape's width/height in points. Consumes the matching EndElement.
+// doc, when non-nil, is forwarded to the textbox content extractor so
+// rich w:txbxContent (paragraphs / tables / formatting) survives.
+func decodeVMLShape(dec *xml.Decoder, start xml.StartElement, doc *Document) (*VMLShape, bool, string, float64, float64) {
+	kind := start.Name.Local
+	if kind == "shape" {
+		kind = "rect"
+	}
+	sh := &VMLShape{Kind: kind}
+	var rid string
+	var isHR bool
+
+	if style := attr(start, "style"); style != "" {
+		w, h := parseVMLSize(style)
+		if w > 0 {
+			sh.WidthPt = w
+		}
+		if h > 0 {
+			sh.HeightPt = h
+		}
+	}
+	if attr(start, "hr") == "t" {
+		isHR = true
+	}
+	if v := attr(start, "fillcolor"); v != "" {
+		sh.FillColor = strings.TrimPrefix(strings.ToUpper(v), "#")
+	}
+	if v := attr(start, "strokecolor"); v != "" {
+		sh.StrokeColor = strings.TrimPrefix(strings.ToUpper(v), "#")
+	}
+	if v := attr(start, "strokeweight"); v != "" {
+		sh.StrokeWeightPt = parseCSSLength(v)
+	}
+	if v := attr(start, "filled"); v == "false" || v == "f" {
+		sh.FillColor = ""
+	}
+	if v := attr(start, "stroked"); v == "false" || v == "f" {
+		sh.StrokeColor = ""
+	}
+	if v := attr(start, "points"); v != "" {
+		sh.Points = v
+	}
+	if v := attr(start, "arcsize"); v != "" {
+		if x, err := strconv.ParseFloat(v, 64); err == nil {
+			if x > 1 {
+				x /= 65536.0
+			}
+			sh.CornerArc = x
+		}
+	}
+
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "shape", "rect", "roundrect", "oval", "line", "polyline", "group":
+				// Nested child shape (most common inside v:group).
+				child, childHR, childRID, _, _ := decodeVMLShape(dec, t, doc)
+				if childHR {
+					isHR = true
+				}
+				if rid == "" {
+					rid = childRID
+				}
+				if child != nil {
+					sh.Children = append(sh.Children, *child)
+				}
+				continue
+			case "imagedata":
+				for _, a := range t.Attr {
+					if a.Name.Local == "id" || a.Name.Local == "relid" {
+						rid = a.Value
+						break
+					}
+				}
+				_ = dec.Skip()
+				continue
+			case "fill":
+				if v := attr(t, "color"); v != "" {
+					sh.FillColor = strings.TrimPrefix(strings.ToUpper(v), "#")
+				}
+				_ = dec.Skip()
+				continue
+			case "stroke":
+				if v := attr(t, "color"); v != "" {
+					sh.StrokeColor = strings.TrimPrefix(strings.ToUpper(v), "#")
+				}
+				if v := attr(t, "weight"); v != "" {
+					sh.StrokeWeightPt = parseCSSLength(v)
+				}
+				_ = dec.Skip()
+				continue
+			case "textbox":
+				txt, blocks := readVMLTextbox(dec, t, doc)
+				if txt != "" {
+					if sh.TextBox != "" {
+						sh.TextBox += " "
+					}
+					sh.TextBox += txt
+				}
+				if len(blocks) > 0 {
+					sh.TextBoxBlocks = append(sh.TextBoxBlocks, blocks...)
+				}
+				continue
+			}
+			depth++
+		case xml.EndElement:
+			depth--
+		}
+	}
+	if start.Name.Local == "group" {
+		sh.Kind = "group"
+	}
+	if rid != "" {
+		return nil, isHR, rid, sh.WidthPt, sh.HeightPt
+	}
+	return sh, isHR, "", sh.WidthPt, sh.HeightPt
+}
+
+// readVMLTextbox drains a <v:textbox> subtree, returning both a flat
+// text string and the structured w:txbxContent block tree (when
+// present). The block path lets the renderer paint bold/list/table
+// content inside legacy VML textboxes too — Word still emits these for
+// Outlook / older converters.
+func readVMLTextbox(dec *xml.Decoder, start xml.StartElement, doc *Document) (string, []Block) {
+	var flat strings.Builder
+	var blocks []Block
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return strings.TrimSpace(flat.String()), blocks
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "txbxContent" {
+				txt, bs, e := extractTxbxRich(dec, t, doc)
+				if e != nil {
+					return strings.TrimSpace(flat.String()), blocks
+				}
+				if txt != "" {
+					if flat.Len() > 0 {
+						flat.WriteByte(' ')
+					}
+					flat.WriteString(txt)
+				}
+				if len(bs) > 0 {
+					blocks = append(blocks, bs...)
+				}
+				continue
+			}
+			depth++
+		case xml.EndElement:
+			depth--
+		case xml.CharData:
+			flat.Write(t)
+			flat.WriteByte(' ')
+		}
+	}
+	return strings.TrimSpace(flat.String()), blocks
 }
 
 // parseVMLSize extracts width and height in points from a VML CSS-like
@@ -3321,6 +4771,18 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 					return err
 				}
 				continue
+			case "tblInd":
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						tbl.IndentTwips = x
+					}
+				}
+			case "tblCellSpacing":
+				if v := attr(t, "w"); v != "" {
+					if x, err := strconv.Atoi(v); err == nil {
+						tbl.CellSpacingTwips = x
+					}
+				}
 			case "tblLook":
 				// Word can encode either via individual w:firstRow="1" attrs
 				// or via a single w:val hex bitmask. Handle both.
@@ -3342,6 +4804,8 @@ func decodeTblPr(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 				if flagSet(attr(t, "noVBand")) {
 					tbl.Look.NoVBand = true
 				}
+			case "tblPrChange":
+				tbl.PrChange = readPrChangeAttrs(t, "tblPr")
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3394,11 +4858,19 @@ func decodeTblGrid(dec *xml.Decoder, start xml.StartElement, tbl *Table) error {
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "gridCol" {
+			switch t.Name.Local {
+			case "gridCol":
 				if v := attr(t, "w"); v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
 						tbl.ColumnWidthsTwips = append(tbl.ColumnWidthsTwips, x)
 					}
+				}
+			case "tblGridChange":
+				// Tracked change of the grid column list. We don't replace
+				// our current widths — caller wants the post-edit grid —
+				// but record the change so a change bar can be drawn.
+				if tbl.PrChange == nil {
+					tbl.PrChange = readPrChangeAttrs(t, "tblGrid")
 				}
 			}
 			_ = dec.Skip()
@@ -3486,6 +4958,8 @@ func decodeTrPr(dec *xml.Decoder, start xml.StartElement, row *TableRow) error {
 				row.WAfterTwips = parseTwips(t)
 			case "tblCellSpacing":
 				row.CellSpacingTwips = parseTwips(t)
+			case "trPrChange":
+				row.PrChange = readPrChangeAttrs(t, "trPr")
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3612,6 +5086,9 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 				if err := decodeTcMar(dec, t, cell); err != nil {
 					return err
 				}
+			case "tcPrChange":
+				cell.PrChange = readPrChangeAttrs(t, "tcPr")
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
@@ -3624,8 +5101,13 @@ func decodeTcPr(dec *xml.Decoder, start xml.StartElement, cell *TableCell) error
 }
 
 // decodePgBorders is structurally identical to decodeCellBorders, just over
-// a PageBorders target — Word reuses the border-edge XML schema.
+// a PageBorders target — Word reuses the border-edge XML schema. Reads
+// the parent element's w:offsetFrom attribute and each edge's w:space to
+// compute the inset.
 func decodePgBorders(dec *xml.Decoder, start xml.StartElement, b *PageBorders) error {
+	if v := attr(start, "offsetFrom"); v == "text" {
+		b.OffsetFromText = true
+	}
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -3639,15 +5121,27 @@ func decodePgBorders(dec *xml.Decoder, start xml.StartElement, b *PageBorders) e
 					edge.Sz = float64(x) / 8.0
 				}
 			}
+			// w:space is the inset from the reference edge (page or text)
+			// in POINTS, not twips.
+			offsetPt := 24.0
+			if v := attr(t, "space"); v != "" {
+				if x, err := strconv.Atoi(v); err == nil {
+					offsetPt = float64(x)
+				}
+			}
 			switch t.Name.Local {
 			case "top":
 				b.Top = edge
+				b.OffsetTopPt = offsetPt
 			case "bottom":
 				b.Bottom = edge
+				b.OffsetBottomPt = offsetPt
 			case "left":
 				b.Left = edge
+				b.OffsetLeftPt = offsetPt
 			case "right":
 				b.Right = edge
+				b.OffsetRightPt = offsetPt
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3728,6 +5222,10 @@ func decodeCellBorders(dec *xml.Decoder, start xml.StartElement, b *CellBorders)
 				b.Left = edge
 			case "right", "end":
 				b.Right = edge
+			case "tl2br":
+				b.TL2BR = edge
+			case "tr2bl":
+				b.TR2BL = edge
 			}
 			_ = dec.Skip()
 		case xml.EndElement:
@@ -3925,7 +5423,21 @@ func decodeSectPr(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContex
 						sec.ColumnSpaceTwips = x
 					}
 				}
-				_ = dec.Skip()
+				if v := attr(t, "sep"); v == "1" || v == "true" {
+					sec.ColumnSeparator = true
+				}
+				if v := attr(t, "equalWidth"); v == "0" || v == "false" {
+					sec.ColumnEqualWidth = false
+				} else {
+					sec.ColumnEqualWidth = true
+				}
+				// Children: <w:col w:w="…" w:space="…"/> — per-column widths
+				// when equalWidth=false. We collect them and stash on the
+				// section; renderer falls back to equal distribution when
+				// the slice is empty.
+				if err := decodeColsChildren(dec, t, sec); err != nil {
+					return err
+				}
 			case "pgSz":
 				if v := attr(t, "w"); v != "" {
 					if x, err := strconv.Atoi(v); err == nil {
@@ -3965,9 +5477,46 @@ func decodeSectPr(dec *xml.Decoder, start xml.StartElement, pctx *parseDocContex
 					}
 				}
 				_ = dec.Skip()
+			case "sectPrChange":
+				sec.PrChange = readPrChangeAttrs(t, "sectPr")
+				_ = dec.Skip()
 			default:
 				_ = dec.Skip()
 			}
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
+			}
+		}
+	}
+}
+
+// decodeColsChildren reads <w:col w:w="…" w:space="…"/> children of a
+// w:cols element into sec.ColumnSpecs. The decoder cursor must already be
+// positioned past the w:cols start tag.
+func decodeColsChildren(dec *xml.Decoder, start xml.StartElement, sec *Section) error {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "col" {
+				spec := ColumnSpec{}
+				if v := attr(t, "w"); v != "" {
+					if x, e := strconv.Atoi(v); e == nil {
+						spec.WidthTwips = x
+					}
+				}
+				if v := attr(t, "space"); v != "" {
+					if x, e := strconv.Atoi(v); e == nil {
+						spec.SpaceTwips = x
+					}
+				}
+				sec.ColumnSpecs = append(sec.ColumnSpecs, spec)
+			}
+			_ = dec.Skip()
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
 				return nil
@@ -4035,6 +5584,62 @@ func onOff(se xml.StartElement) bool {
 		return true
 	}
 	return false
+}
+
+// onOffValAttr returns the boolean reading of a w:val attribute. Same
+// rules as onOff except this is intended for elements where the attr is
+// the only data the caller cares about.
+func onOffValAttr(se xml.StartElement) bool { return onOff(se) }
+
+// onOffPtr returns a pointer to the boolean reading of w:val so callers
+// can distinguish "absent" (nil) from "explicit false". Used for
+// CompatOptions where each flag carries semantic meaning either way.
+func onOffPtr(se xml.StartElement) *bool {
+	v := onOff(se)
+	return &v
+}
+
+// decodeCompat reads a w:compat block, picking up the subset of options
+// we model on CompatOptions. Unknown children are silently skipped.
+func decodeCompat(dec *xml.Decoder, start xml.StartElement, s *Settings) error {
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "doNotExpandShiftReturn":
+				s.Compat.DoNotExpandShiftReturn = onOffPtr(t)
+			case "useSingleBorderforContiguousCells":
+				s.Compat.UseSingleBorderForContiguousCells = onOffPtr(t)
+			case "growAutofit":
+				s.Compat.GrowAutofit = onOffPtr(t)
+			case "noLeading":
+				s.Compat.NoLeading = onOffPtr(t)
+			case "spacingInWholePoints":
+				s.Compat.SpacingInWholePoints = onOffPtr(t)
+			case "balanceSingleByteDoubleByteWidth":
+				s.Compat.BalanceSingleByteDoubleByteWidth = onOffPtr(t)
+			case "doNotUseEastAsianBreakRules":
+				s.Compat.DoNotUseEastAsianBreakRules = onOffPtr(t)
+			case "suppressTopSpacing":
+				s.Compat.SuppressTopSpacing = onOffPtr(t)
+			case "ulTrailSpace":
+				s.Compat.UlTrailSpace = onOffPtr(t)
+			case "doNotLeaveBackslashAlone":
+				s.Compat.DoNotLeaveBackslashAlone = onOffPtr(t)
+			case "useFELayout":
+				s.Compat.UseFELayout = onOffPtr(t)
+			}
+			_ = dec.Skip()
+		case xml.EndElement:
+			if t.Name.Local == start.Name.Local {
+				return nil
+			}
+		}
+	}
 }
 
 // frameHasPositioning reports whether a w:framePr element carries any

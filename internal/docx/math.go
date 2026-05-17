@@ -40,34 +40,57 @@ func extractMathText(dec *xml.Decoder, start xml.StartElement) (string, error) {
 	return mr.render(), nil
 }
 
+// ExtractMathTree walks an m:oMath / m:oMathPara subtree and returns the
+// structural MathNode tree plus the flat string approximation (suitable
+// as a textual fallback). The renderer prefers the tree when it can paint
+// 2D math; the string keeps text-search of the PDF working.
+func ExtractMathTree(dec *xml.Decoder, start xml.StartElement) (*MathNode, string, error) {
+	mr, err := decodeMathNode(dec, start)
+	if err != nil {
+		return nil, "", err
+	}
+	if mr == nil {
+		return nil, "", nil
+	}
+	return mr, mr.render(), nil
+}
+
 // mathNode is an OMML subtree we know how to render to a string. Each
 // node has a kind plus a small set of slots — argument lists for things
 // like sub/sup, delimiters, n-ary operators, accents.
-type mathNode struct {
-	kind     string
-	text     string      // raw text for "r" / "t" / accentChar / numerator-tex etc.
-	children []*mathNode // generic ordered children (e.g. inside m:e, m:oMath body)
+type mathNode = MathNode
+
+// MathNode is an OMML subtree the renderer can either flatten to a string
+// (via render()) or lay out structurally on the PDF canvas (the render
+// package walks the tree directly). Each node has a kind plus a small set
+// of slots for sub/sup, delimiters, n-ary operators, accents, etc. All
+// fields are exported so the render package can read them without going
+// through accessor methods.
+type MathNode struct {
+	Kind     string
+	Text     string      // raw text for "r" / "t" / accentChar / numerator-tex etc.
+	Children []*MathNode // generic ordered children (e.g. inside m:e, m:oMath body)
 	// Named slots for structured elements. Empty when not applicable.
-	num   *mathNode // m:f numerator
-	den   *mathNode // m:f denominator
-	base  *mathNode // m:sSup / m:sSub / m:sSubSup / m:rad / m:nary / m:limLow / m:limUpp / m:acc / m:groupChr / m:bar / m:box / m:func base
-	sup   *mathNode // superscript
-	sub   *mathNode // subscript
-	deg   *mathNode // m:rad degree
-	limLo *mathNode // m:limLow / m:nary lower limit
-	limUp *mathNode // m:limUpp / m:nary upper limit
-	arg   *mathNode // m:func argument
+	Num   *MathNode // m:f numerator
+	Den   *MathNode // m:f denominator
+	Base  *MathNode // m:sSup / m:sSub / m:sSubSup / m:rad / m:nary / m:limLow / m:limUpp / m:acc / m:groupChr / m:bar / m:box / m:func base
+	Sup   *MathNode // superscript
+	Sub   *MathNode // subscript
+	Deg   *MathNode // m:rad degree
+	LimLo *MathNode // m:limLow / m:nary lower limit
+	LimUp *MathNode // m:limUpp / m:nary upper limit
+	Arg   *MathNode // m:func argument
 	// matrix rows; each row is a list of "e" cells.
-	rows [][]*mathNode
+	Rows [][]*MathNode
 	// Per-element formatting hints pulled from props.
-	begChar  string // m:dPr begChr
-	endChar  string // m:dPr endChr
-	sepChar  string // m:dPr sepChar (defaults to ",")
-	naryChar string // m:naryPr chr (∑, ∫, ∏ ...)
-	accChar  string // m:accPr chr
+	BegChar  string // m:dPr begChr
+	EndChar  string // m:dPr endChr
+	SepChar  string // m:dPr sepChar (defaults to ",")
+	NaryChar string // m:naryPr chr (∑, ∫, ∏ ...)
+	AccChar  string // m:accPr chr
 }
 
-func newMathNode(kind string) *mathNode { return &mathNode{kind: kind} }
+func newMathNode(kind string) *mathNode { return &mathNode{Kind: kind} }
 
 // decodeMathNode walks one element and returns its mathNode. Recognizes
 // OMML structural elements; treats unknown ones as opaque text wrappers
@@ -90,68 +113,68 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 			// element name (m:num / m:den / m:e / m:sup / m:sub / etc.).
 			switch t.Name.Local {
 			case "num":
-				n.num = child
+				n.Num = child
 			case "den":
-				n.den = child
+				n.Den = child
 			case "e":
-				if n.kind == "mr" {
+				if n.Kind == "mr" {
 					// matrix row child cells appear as m:e directly inside m:mr.
-					if len(n.rows) == 0 {
-						n.rows = append(n.rows, nil)
+					if len(n.Rows) == 0 {
+						n.Rows = append(n.Rows, nil)
 					}
-					n.rows[0] = append(n.rows[0], child)
+					n.Rows[0] = append(n.Rows[0], child)
 				} else {
-					n.base = child
+					n.Base = child
 				}
 			case "sup":
-				n.sup = child
+				n.Sup = child
 			case "sub":
-				n.sub = child
+				n.Sub = child
 			case "deg":
-				n.deg = child
+				n.Deg = child
 			case "lim":
 				// m:limLow and m:limUpp wrap a m:lim element holding the
 				// limit expression.
-				if n.kind == "limLow" || n.kind == "naryLimLow" {
-					n.limLo = child
-				} else if n.kind == "limUpp" || n.kind == "naryLimUpp" {
-					n.limUp = child
+				if n.Kind == "limLow" || n.Kind == "naryLimLow" {
+					n.LimLo = child
+				} else if n.Kind == "limUpp" || n.Kind == "naryLimUpp" {
+					n.LimUp = child
 				} else {
-					n.children = append(n.children, child)
+					n.Children = append(n.Children, child)
 				}
 			case "fName":
-				n.arg = child
+				n.Arg = child
 			case "mr":
-				n.rows = append(n.rows, child.rows[0])
+				n.Rows = append(n.Rows, child.Rows[0])
 			case "dPr":
-				n.begChar = child.begChar
-				n.endChar = child.endChar
-				n.sepChar = child.sepChar
+				n.BegChar = child.BegChar
+				n.EndChar = child.EndChar
+				n.SepChar = child.SepChar
 			case "naryPr":
-				n.naryChar = child.naryChar
+				n.NaryChar = child.NaryChar
 				// nary props also carry sub-position / lim-loc info; we
 				// ignore those (formatting only).
 			case "accPr":
-				n.accChar = child.accChar
+				n.AccChar = child.AccChar
 			case "begChr":
-				n.begChar = child.text
+				n.BegChar = child.Text
 			case "endChr":
-				n.endChar = child.text
+				n.EndChar = child.Text
 			case "sepChr":
-				n.sepChar = child.text
+				n.SepChar = child.Text
 			case "chr":
-				// chr is reused across many props elements; n.kind tells
+				// chr is reused across many props elements; n.Kind tells
 				// us which to assign to. naryPr.chr → naryChar;
 				// accPr.chr → accChar; groupChrPr.chr → base text.
-				if n.kind == "naryPr" {
-					n.naryChar = child.text
-				} else if n.kind == "accPr" {
-					n.accChar = child.text
-				} else if n.kind == "groupChrPr" {
-					n.accChar = child.text
+				if n.Kind == "naryPr" {
+					n.NaryChar = child.Text
+				} else if n.Kind == "accPr" {
+					n.AccChar = child.Text
+				} else if n.Kind == "groupChrPr" {
+					n.AccChar = child.Text
 				}
 			default:
-				n.children = append(n.children, child)
+				n.Children = append(n.Children, child)
 			}
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local {
@@ -159,17 +182,17 @@ func decodeMathNode(dec *xml.Decoder, start xml.StartElement) (*mathNode, error)
 			}
 		case xml.CharData:
 			// m:t holds the literal glyph text; everything else is
-			// structural. Accumulate CharData into n.text.
-			n.text += string(t)
+			// structural. Accumulate CharData into n.Text.
+			n.Text += string(t)
 		}
 		// For attribute-bearing elements (begChr / endChr / sepChr / chr),
 		// we also want the "val" attribute (some writers put the literal
 		// glyph in val instead of in CharData).
 		if start.Name.Local == "begChr" || start.Name.Local == "endChr" || start.Name.Local == "sepChr" || start.Name.Local == "chr" {
-			if n.text == "" {
+			if n.Text == "" {
 				for _, a := range start.Attr {
 					if a.Name.Local == "val" && a.Value != "" {
-						n.text = a.Value
+						n.Text = a.Value
 					}
 				}
 			}
@@ -182,37 +205,46 @@ func (n *mathNode) render() string {
 	if n == nil {
 		return ""
 	}
-	switch n.kind {
+	switch n.Kind {
 	case "t":
-		return n.text
+		return n.Text
 	case "r", "e", "num", "den", "deg", "sup", "sub", "lim", "fName", "oMath", "oMathPara":
 		return n.joinChildren()
 	case "f":
 		// Fraction: render as "num/den" with parens around multi-token
 		// halves so the precedence reads sensibly.
-		num, den := n.num.render(), n.den.render()
+		num, den := n.Num.render(), n.Den.render()
 		return wrapIfComplex(num) + "/" + wrapIfComplex(den)
 	case "rad":
-		base := n.base.render()
-		deg := n.deg.render()
+		base := n.Base.render()
+		deg := n.Deg.render()
 		if deg != "" {
 			return supScript(deg) + "√(" + base + ")"
 		}
 		return "√(" + base + ")"
 	case "sSup":
-		return n.base.render() + supScript(n.sup.render())
+		return n.Base.render() + supScript(n.Sup.render())
 	case "sSub":
-		return n.base.render() + subScript(n.sub.render())
+		return n.Base.render() + subScript(n.Sub.render())
 	case "sSubSup":
-		return n.base.render() + subScript(n.sub.render()) + supScript(n.sup.render())
+		return n.Base.render() + subScript(n.Sub.render()) + supScript(n.Sup.render())
 	case "nary":
-		op := n.naryChar
+		op := n.NaryChar
 		if op == "" {
 			op = "∑"
 		}
-		lo := n.limLo.render()
-		up := n.limUp.render()
-		body := n.base.render()
+		// nary's lower/upper limits live in m:sub/m:sup in the wire
+		// format — the decoder routes them to n.Sub / n.Sup. Older
+		// docs use m:limLow/m:limUpp inside m:nary; respect both.
+		lo := n.LimLo.render()
+		if lo == "" {
+			lo = n.Sub.render()
+		}
+		up := n.LimUp.render()
+		if up == "" {
+			up = n.Sup.render()
+		}
+		body := n.Base.render()
 		s := op
 		if lo != "" {
 			s += subScript(lo)
@@ -228,20 +260,20 @@ func (n *mathNode) render() string {
 		// Delimited group: render with the begChar/endChar pair, defaulting
 		// to round brackets. If multiple m:e children exist they are
 		// separated by sepChar (default ",").
-		open, close := n.begChar, n.endChar
+		open, close := n.BegChar, n.EndChar
 		if open == "" {
 			open = "("
 		}
 		if close == "" {
 			close = ")"
 		}
-		sep := n.sepChar
+		sep := n.SepChar
 		if sep == "" {
 			sep = ", "
 		}
-		parts := make([]string, 0, len(n.children))
-		for _, c := range n.children {
-			if c.kind == "e" {
+		parts := make([]string, 0, len(n.Children))
+		for _, c := range n.Children {
+			if c.Kind == "e" {
 				parts = append(parts, c.render())
 			}
 		}
@@ -250,36 +282,36 @@ func (n *mathNode) render() string {
 		}
 		return open + strings.Join(parts, sep) + close
 	case "func":
-		return n.arg.render() + "(" + n.base.render() + ")"
+		return n.Arg.render() + "(" + n.Base.render() + ")"
 	case "limLow":
-		return n.base.render() + subScript(n.limLo.render())
+		return n.Base.render() + subScript(n.LimLo.render())
 	case "limUpp":
-		return n.base.render() + supScript(n.limUp.render())
+		return n.Base.render() + supScript(n.LimUp.render())
 	case "acc":
 		// Accent: stack the accent char after the base (Unicode combining
 		// behaviour). If the accent char is empty fall back to U+0302
 		// (combining circumflex).
-		ch := n.accChar
+		ch := n.AccChar
 		if ch == "" {
 			ch = "̂"
 		}
-		return n.base.render() + ch
+		return n.Base.render() + ch
 	case "bar":
-		return "‾" + n.base.render()
+		return "‾" + n.Base.render()
 	case "box":
-		return "⌜" + n.base.render() + "⌝"
+		return "⌜" + n.Base.render() + "⌝"
 	case "borderBox":
-		return "[" + n.base.render() + "]"
+		return "[" + n.Base.render() + "]"
 	case "groupChr":
-		ch := n.accChar
+		ch := n.AccChar
 		if ch == "" {
 			ch = "⏞"
 		}
-		return ch + "{" + n.base.render() + "}"
+		return ch + "{" + n.Base.render() + "}"
 	case "m", "matrix":
 		// Matrix: rows separated by "; ", cells in a row by " ".
-		out := make([]string, 0, len(n.rows))
-		for _, row := range n.rows {
+		out := make([]string, 0, len(n.Rows))
+		for _, row := range n.Rows {
 			cells := make([]string, len(row))
 			for i, c := range row {
 				cells[i] = c.render()
@@ -289,9 +321,9 @@ func (n *mathNode) render() string {
 		return "[" + strings.Join(out, "; ") + "]"
 	case "eqArr":
 		// Equation array: stack of equations separated by "; ".
-		parts := make([]string, 0, len(n.children))
-		for _, c := range n.children {
-			if c.kind == "e" {
+		parts := make([]string, 0, len(n.Children))
+		for _, c := range n.Children {
+			if c.Kind == "e" {
 				parts = append(parts, c.render())
 			}
 		}
@@ -310,8 +342,8 @@ func (n *mathNode) joinChildren() string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(n.text)
-	for _, c := range n.children {
+	b.WriteString(n.Text)
+	for _, c := range n.Children {
 		b.WriteString(c.render())
 	}
 	return b.String()
