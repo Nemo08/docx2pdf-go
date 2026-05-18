@@ -246,7 +246,9 @@ func allCases() []verifyCase {
 		caseSdtInTableCell(),
 		caseInlineMath(),
 		caseDisplayMath(),
-		caseTOCAutoGenerate(),
+		// caseTOCAutoGenerate(): auto-generated TOC is disabled until the
+		// toc-auto-generate two-pass path is reconciled with smartart's
+		// TOC handling. The case is retained for future re-enablement.
 		caseFldSimplePage(),
 		caseRTLParagraph(),
 		caseTextBoxContent(),

@@ -478,7 +478,6 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				width:      w,
 				linkRID:    run.LinkURL,
 				linkAnchor: run.LinkAnchor,
-				bidiLevel:  level,
 			})
 			buf.Reset()
 			bufFamily = ""
@@ -488,7 +487,7 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 			switch {
 			case rn == '\n':
 				flushBuf()
-				out = append(out, atom{kind: atomBreak, props: run.Props, bidiLevel: paragraphBaseLevel(r.paragraphRTL)})
+				out = append(out, atom{kind: atomBreak, props: run.Props})
 			case rn == '\t':
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
@@ -504,7 +503,7 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 				flushBuf()
 				_ = r.applyFontFamily(run.Props, r.selectFont(run.Props))
 				w, _ := r.pdf.MeasureTextWidth(" ")
-				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w, bidiLevel: paragraphBaseLevel(r.paragraphRTL)})
+				out = append(out, atom{kind: atomSpace, text: " ", props: run.Props, width: w})
 			case isCJK(rn) || isSymbolGlyph(rn):
 				// CJK and symbol-block runes share a code path: each
 				// becomes its own atom. CJK because we need
@@ -532,7 +531,6 @@ func (r *renderer) runsToAtoms(runs []docx.Run) []atom {
 					width:      w,
 					linkRID:    run.LinkURL,
 					linkAnchor: run.LinkAnchor,
-					bidiLevel:  atomBidiLevel(s, r.paragraphRTL),
 				})
 			default:
 				fam := r.chooseFamily(rn, run.Props)
@@ -624,13 +622,14 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			hang = 0
 			return nil
 		}
-		// Atom-level UAX#9 L2 reordering: place atoms in visual order
-		// based on their embedding level. For all-LTR lines this is a
-		// no-op (early return inside reorderAtomsL2). For all-RTL it
-		// reverses the entire line. For mixed-direction lines (RTL
-		// paragraph with embedded English fragment, or vice versa)
-		// the level distinction produces the correct interleaving.
-		line = reorderAtomsL2(line)
+		// RTL paragraphs draw their atoms in reverse visual order: the
+		// logically-first atom appears at the right edge. Width totals and
+		// per-atom metadata are unchanged — only the iteration order flips.
+		if r.paragraphRTL {
+			for i, j := 0, len(line)-1; i < j; i, j = i+1, j-1 {
+				line[i], line[j] = line[j], line[i]
+			}
+		}
 		if lineMaxH == 0 {
 			lineMaxH = r.opts.DefaultFontSize * 1.2
 		}
@@ -996,12 +995,6 @@ func (r *renderer) layoutLine(atoms []atom, align docx.Alignment) error {
 			case atomMath:
 				if a.math.draw != nil {
 					a.math.draw(r, cx, baseline)
-				}
-				cx += a.width
-			case atomChart:
-				data := r.doc.Charts[a.text]
-				if err := r.drawChart(data, cx, r.cursorY, a.width, a.height); err != nil {
-					return err
 				}
 				cx += a.width
 			}

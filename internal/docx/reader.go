@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
@@ -120,12 +121,6 @@ func Parse(r io.ReaderAt, size int64) (*Document, error) {
 		doc.CustomProperties = map[string]string{}
 		_ = parseCustomProperties(f, doc.CustomProperties)
 	}
-
-	// Embedded fonts (word/fontTable.xml + rels). Best-effort: failure
-	// just leaves doc.EmbeddedFonts nil and the renderer falls back to
-	// system fonts. Suppress to err == nil so a malformed font table
-	// can't keep the rest of the doc from rendering.
-	_ = parseFontTable(files, doc)
 
 	rels := map[string]relEntry{} // rId → relationship metadata
 	if f, ok := files["word/_rels/document.xml.rels"]; ok {
@@ -656,12 +651,6 @@ func parseAppProps(f *zip.File, p *Properties) error {
 			if err := dec.DecodeElement(&s, &se); err == nil {
 				if x, err := strconv.Atoi(s); err == nil {
 					p.Lines = x
-				}
-			}
-		case "TotalTime":
-			if err := dec.DecodeElement(&s, &se); err == nil {
-				if x, err := strconv.Atoi(s); err == nil {
-					p.TotalTime = x
 				}
 			}
 		}
@@ -3831,7 +3820,7 @@ func decodeRun(dec *xml.Decoder, start xml.StartElement, paraRPr RunProps, doc *
 					// through / none) currently render as inline; the
 					// flag is preserved on Run.WrapMode for future
 					// work but isn't honored by the line breaker yet.
-					if di.WrapMode == "topAndBottom" {
+					if di.WrapType == "topAndBottom" {
 						atoms = append(atoms, Run{IsBreak: true, Props: rp})
 					}
 					atoms = append(atoms, Run{

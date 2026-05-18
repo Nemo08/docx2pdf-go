@@ -75,24 +75,6 @@ type fieldVars struct {
 	saveDate     time.Time
 	printDate    time.Time
 
-	// Doc properties exposed by name to DOCPROPERTY. Populated once
-	// during renderer init from doc.Properties; per-page rebuilds keep
-	// the same map reference. Keys are case-insensitive — see
-	// docPropertyByName.
-	docProps map[string]string
-
-	// w:docVars from settings.xml, surfaced to DOCVARIABLE. Same
-	// case-insensitive lookup semantics as docProps.
-	docVars map[string]string
-
-	// Timestamps surfaced to SAVEDATE / CREATEDATE / PRINTDATE.
-	created     time.Time
-	modified    time.Time
-	lastPrinted time.Time
-
-	// Edit-minutes for EDITTIME.
-	totalTime int
-
 	seqCounters map[string]int
 	bookmarks   map[string]string
 	// bookmarkPages maps bookmark name → 1-based PDF page number where it

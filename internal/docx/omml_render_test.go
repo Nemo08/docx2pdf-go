@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// renderMath helpers: decode an oMath XML snippet and return its
+// runRenderMath helpers: decode an oMath XML snippet and return its
 // rendered string.
-func renderMath(t *testing.T, xmlSnippet string) string {
+func runRenderMath(t *testing.T, xmlSnippet string) string {
 	t.Helper()
 	dec := xml.NewDecoder(strings.NewReader(xmlSnippet))
 	for {
@@ -34,7 +34,7 @@ func TestOMML_Fraction_RendersStructurally(t *testing.T) {
 	const m = `<m:oMath xmlns:m="urn:m">
 <m:f><m:num><m:r><m:t>2x+1</m:t></m:r></m:num><m:den><m:r><m:t>x-3</m:t></m:r></m:den></m:f>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	want := "(2x+1)/(x-3)"
 	if !strings.Contains(got, want) {
 		t.Errorf("fraction render = %q, want it to contain %q", got, want)
@@ -47,7 +47,7 @@ func TestOMML_Radical_RendersStructurally(t *testing.T) {
 	const m = `<m:oMath xmlns:m="urn:m">
 <m:rad><m:e><m:r><m:t>x</m:t></m:r></m:e></m:rad>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	if !strings.Contains(got, "√") || !strings.Contains(got, "x") {
 		t.Errorf("radical = %q, want it to contain √ and x", got)
 	}
@@ -62,7 +62,7 @@ func TestOMML_NthRoot_ShowsDegree(t *testing.T) {
   <m:e><m:r><m:t>x</m:t></m:r></m:e>
 </m:rad>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	// expect ³√(x) — superscript 3 + radical
 	if !strings.Contains(got, "³") || !strings.Contains(got, "√") {
 		t.Errorf("nth-root = %q, want it to contain ³ and √", got)
@@ -80,7 +80,7 @@ func TestOMML_NaryWithLimits_ShowsBoth(t *testing.T) {
   <m:e><m:r><m:t>i</m:t></m:r></m:e>
 </m:nary>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	if !strings.Contains(got, "∑") {
 		t.Errorf("nary = %q, want ∑", got)
 	}
@@ -98,7 +98,7 @@ func TestOMML_Superscript_RendersInline(t *testing.T) {
   <m:sup><m:r><m:t>2</m:t></m:r></m:sup>
 </m:sSup>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	if !strings.Contains(got, "x²") && !strings.Contains(got, "x^(2)") {
 		t.Errorf("sSup = %q, want x² or x^(2)", got)
 	}
@@ -113,7 +113,7 @@ func TestOMML_Matrix_PreservesRowStructure(t *testing.T) {
   <m:mr><m:e><m:r><m:t>c</m:t></m:r></m:e><m:e><m:r><m:t>d</m:t></m:r></m:e></m:mr>
 </m:m>
 </m:oMath>`
-	got := renderMath(t, m)
+	got := runRenderMath(t, m)
 	if !strings.Contains(got, ";") {
 		t.Errorf("matrix = %q, want '; ' row separator", got)
 	}

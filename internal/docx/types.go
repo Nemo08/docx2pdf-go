@@ -8,7 +8,6 @@ package docx
 
 import (
 	"image"
-	"time"
 )
 
 // Document is the top-level parsed result of a .docx file.
@@ -446,14 +445,16 @@ type WriteProtection struct {
 // we surface them for the PDF /Info dictionary and for the DOCPROPERTY /
 // MERGEFIELD / SAVEDATE / etc. field codes that look them up by name.
 type Properties struct {
-	Title      string
-	Author     string
-	Subject    string
-	Company    string
-	Pages      int
-	Words      int
-	Characters int
-	Lines      int
+	Title       string
+	Author      string
+	Subject     string
+	Company     string
+	Manager     string
+	Application string
+	Pages       int
+	Words       int
+	Characters  int
+	Lines       int
 	// TotalTime is the total document editing time in minutes — surfaced by
 	// the EDITTIME field. Parsed from docProps/app.xml `<TotalTime>`.
 	TotalTime int

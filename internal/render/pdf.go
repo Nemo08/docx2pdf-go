@@ -59,12 +59,6 @@ type Options struct {
 	// bookmarkPages without producing a usable PDF.
 	skipWrite bool
 
-	// onHeadingPage is set internally during the TOC discovery render
-	// (see toc.go). drawParagraph invokes it for every heading-styled
-	// paragraph with the page number that paragraph landed on. Nil in
-	// the normal render path.
-	onHeadingPage func(title, styleID string, page int)
-
 	// FontRegular is the path to the TTF used for normal text. When
 	// empty, resolution order is: $DOCX2PDF_FONT env var, then a list
 	// of common system-font locations (Arial / Helvetica on macOS,
@@ -159,11 +153,6 @@ func Render(doc *docx.Document, outPath string, opts Options) error {
 }
 
 // RenderWriter is the streaming variant — writes the produced PDF to w.
-//
-// When the document carries a TOC field, RenderWriter routes through
-// the two-pass orchestrator in toc.go so the auto-generated table of
-// contents picks up real page numbers from a discovery render. The
-// normal single-pass path runs otherwise.
 func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 	// Two-pass layout for PAGEREF forward-references. When the doc has any
 	// PAGEREF field and we're not already running the second pass, do a
@@ -286,12 +275,11 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 		CreationDate: creationDate,
 	})
 	r := &renderer{
-		pdf:              &pdf,
-		doc:              doc,
-		opts:             opts,
-		fonts:            map[string]bool{},
-		counters:         map[int]map[int]int{},
-		embeddedFontData: embeddedFontData,
+		pdf:      &pdf,
+		doc:      doc,
+		opts:     opts,
+		fonts:    map[string]bool{},
+		counters: map[int]map[int]int{},
 		fields: fieldVars{
 			now:           time.Now(),
 			decimalSymbol: doc.Settings.DecimalSymbol,
@@ -590,26 +578,20 @@ func RenderWriter(doc *docx.Document, w io.Writer, opts Options) error {
 // renderer carries the drawing state through one Render call. Methods on
 // renderer live in the topic-specific files (page.go, paragraph.go, ...).
 type renderer struct {
-	pdf      *gopdf.GoPdf
-	doc      *docx.Document
-	opts     Options
-	pageW    float64
-	pageH    float64
-	marL     float64
-	marR     float64
-	marT     float64
-	marB     float64
-	contentW float64
-	cursorY  float64
-	fonts    map[string]bool     // registered font names
-	counters map[int]map[int]int // numId → level → next counter value
-	// embeddedFontData maps sentinel paths of the form
-	//   "<embedded-doc:<fontname>:<variant>>"
-	// to font bytes pulled from the document's word/fontTable.xml +
-	// word/fonts/* parts. loadFont recognizes the prefix and uses
-	// AddTTFFontData instead of stat'ing the filesystem.
-	embeddedFontData map[string][]byte
-	noPageBreak      bool // when true, ensureRoom never adds pages
+	pdf         *gopdf.GoPdf
+	doc         *docx.Document
+	opts        Options
+	pageW       float64
+	pageH       float64
+	marL        float64
+	marR        float64
+	marT        float64
+	marB        float64
+	contentW    float64
+	cursorY     float64
+	fonts       map[string]bool     // registered font names
+	counters    map[int]map[int]int // numId → level → next counter value
+	noPageBreak bool                // when true, ensureRoom never adds pages
 	// Multi-column layout (w:cols).
 	numColumns float64
 	colW       float64
