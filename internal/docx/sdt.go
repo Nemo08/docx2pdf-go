@@ -29,6 +29,18 @@ type sdtProps struct {
 	dateFormat    string
 	dateFullValue string
 	checked       bool
+	// checkedGlyph / uncheckedGlyph are the user-customised symbol code
+	// points for w14:checkbox / w14:checkedState / w14:uncheckedState. A
+	// font hint may also live alongside; we keep both. Empty falls back
+	// to ☒ (U+2612) and ☐ (U+2610) at render time.
+	checkedGlyph   string
+	uncheckedGlyph string
+	checkedFont    string
+	uncheckedFont  string
+	// multiline flags <w:text w:multiLine="1"/> — plain-text SDT with
+	// embedded line breaks. Renderer can keep newlines instead of folding
+	// them to a single line.
+	multiline bool
 	// choices lists displayText values in declaration order — what the
 	// user sees in the dropdown menu.
 	choices []string
@@ -81,7 +93,7 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 						bindingResolved = true
 					}
 				} else if props.odXpath != "" {
-					if v, ok := resolveOpenDoPEXPath(pctx.doc, props.odXpath); ok {
+					if v, ok := resolveOpenDoPEXPathInContext(pctx.doc, props.odXpath, pctx.repeatStack); ok {
 						boundText = v
 						bindingResolved = true
 					}
@@ -112,7 +124,7 @@ func decodeBlockSdt(dec *xml.Decoder, start xml.StartElement, pctx *parseDocCont
 				// applyRepeatContext, so each clone resolves its own
 				// iteration's data instead of all sharing iteration 0.
 				if props.odRepeat != "" {
-					n := resolveOpenDoPERepeatCount(pctx.doc, props.odRepeat)
+					n := resolveOpenDoPERepeatCountInContext(pctx.doc, props.odRepeat, pctx.repeatStack)
 					if n <= 0 {
 						_ = dec.Skip()
 						continue
@@ -193,7 +205,13 @@ func sdtSyntheticText(p sdtProps) (string, bool) {
 	switch p.kind {
 	case "checkbox":
 		if p.checked {
+			if p.checkedGlyph != "" {
+				return p.checkedGlyph, true
+			}
 			return "☒", true
+		}
+		if p.uncheckedGlyph != "" {
+			return p.uncheckedGlyph, true
 		}
 		return "☐", true
 	case "date":
@@ -317,6 +335,27 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 				case "1", "true", "on", "":
 					p.checked = true
 				}
+			case "checkedState":
+				// w14:checkedState carries a custom glyph code-point + font
+				// for the "checked" state. val is a 4-hex code-point; font
+				// is the font family used to render it.
+				if v := attr(t, "val"); v != "" {
+					if cp, err := strconv.ParseInt(v, 16, 32); err == nil {
+						p.checkedGlyph = string(rune(cp))
+					}
+				}
+				if f := attr(t, "font"); f != "" {
+					p.checkedFont = f
+				}
+			case "uncheckedState":
+				if v := attr(t, "val"); v != "" {
+					if cp, err := strconv.ParseInt(v, 16, 32); err == nil {
+						p.uncheckedGlyph = string(rune(cp))
+					}
+				}
+				if f := attr(t, "font"); f != "" {
+					p.uncheckedFont = f
+				}
 			case "dropDownList":
 				if p.kind == "" {
 					p.kind = "dropdown"
@@ -356,6 +395,14 @@ func scanSdtProps(dec *xml.Decoder, start xml.StartElement) sdtProps {
 				}
 				if v := attr(t, "default"); v != "" {
 					p.defaultText = v
+				}
+				// <w:text w:multiLine="1"/> opts into embedded line breaks
+				// on plain-text SDTs; default is single-line.
+				if t.Name.Local == "text" {
+					switch attr(t, "multiLine") {
+					case "1", "true", "on":
+						p.multiline = true
+					}
 				}
 			case "picture":
 				if p.kind == "" {
@@ -540,7 +587,7 @@ func decodeInlineSdt(dec *xml.Decoder, start xml.StartElement, p *Paragraph, par
 						bindingResolved = true
 					}
 				} else if props.odXpath != "" {
-					if v, ok := resolveOpenDoPEXPath(pctx.doc, props.odXpath); ok {
+					if v, ok := resolveOpenDoPEXPathInContext(pctx.doc, props.odXpath, pctx.repeatStack); ok {
 						boundText = v
 						bindingResolved = true
 					}

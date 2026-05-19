@@ -76,9 +76,11 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathBarBox(n, fontSize)
 	case "box":
 		// m:box is a non-visible grouping — pass the base box through.
-		return r.buildMathBox(n.Base, fontSize)
+		// However, some writers attach m:strikeH/V/BLTR/TLBR to the box
+		// itself rather than to m:borderBox. Apply any strikes on top.
+		return applyMathStrikes(r.buildMathBox(n.Base, fontSize), n)
 	case "borderBox":
-		return r.mathBorderBoxBox(n, fontSize)
+		return applyMathStrikes(r.mathBorderBoxBox(n, fontSize), n)
 	case "groupChr":
 		return r.mathGroupChrBox(n, fontSize)
 	case "eqArr":
@@ -100,6 +102,45 @@ func (r *renderer) buildMathBox(n *docx.MathNode, fontSize float64) mathBox {
 		return r.mathTextBox(n.Text, fontSize)
 	}
 	return r.mathSequence(n.Children, fontSize)
+}
+
+// applyMathStrikes overlays cancellation lines on top of a mathBox per
+// m:strikeH/V/BLTR/TLBR. Lines are drawn after the inner box so they
+// sit visually atop the glyphs.
+func applyMathStrikes(inner mathBox, n *docx.MathNode) mathBox {
+	if !n.StrikeH && !n.StrikeV && !n.StrikeBLTR && !n.StrikeTLBR {
+		return inner
+	}
+	origDraw := inner.draw
+	w := inner.w
+	asc := inner.ascent
+	desc := inner.descent
+	inner.draw = func(r *renderer, x, baseline float64) {
+		if origDraw != nil {
+			origDraw(r, x, baseline)
+		}
+		r.pdf.SetStrokeColor(60, 60, 60)
+		r.pdf.SetLineWidth(0.6)
+		top := baseline - asc
+		bot := baseline + desc
+		mid := (top + bot) / 2
+		left := x
+		right := x + w
+		if n.StrikeH {
+			r.pdf.Line(left, mid, right, mid)
+		}
+		if n.StrikeV {
+			mx := (left + right) / 2
+			r.pdf.Line(mx, top, mx, bot)
+		}
+		if n.StrikeBLTR {
+			r.pdf.Line(left, bot, right, top)
+		}
+		if n.StrikeTLBR {
+			r.pdf.Line(left, top, right, bot)
+		}
+	}
+	return inner
 }
 
 // mathTextBox renders a single string at the active font size.
@@ -362,7 +403,11 @@ func (r *renderer) mathRadicalBox(n *docx.MathNode, fontSize float64) mathBox {
 	w := rsW + base.w + 2
 	asc := base.ascent + 2
 	desc := base.descent
-	deg := r.buildMathBox(n.Deg, fontSize*0.6)
+	// m:radPr/m:degHide: suppress the degree even when present.
+	var deg mathBox
+	if !n.DegHide {
+		deg = r.buildMathBox(n.Deg, fontSize*0.6)
+	}
 	if deg.w > 0 {
 		w += deg.w * 0.7
 	}
@@ -833,6 +878,10 @@ func (r *renderer) mathLimBox(n *docx.MathNode, lim *docx.MathNode, low bool, fo
 func (r *renderer) mathBorderBoxBox(n *docx.MathNode, fontSize float64) mathBox {
 	base := r.buildMathBox(n.Base, fontSize)
 	pad := fontSize * 0.2
+	hideTop := n.HideTop
+	hideBot := n.HideBot
+	hideLeft := n.HideLeft
+	hideRight := n.HideRight
 	return mathBox{
 		w:       base.w + pad*2,
 		ascent:  base.ascent + pad,
@@ -843,9 +892,25 @@ func (r *renderer) mathBorderBoxBox(n *docx.MathNode, fontSize float64) mathBox 
 			}
 			top := baseline - base.ascent - pad
 			h := base.height() + pad*2
+			right := x + base.w + pad*2
+			bot := top + h
 			r.pdf.SetLineWidth(0.5)
 			r.pdf.SetStrokeColor(0, 0, 0)
-			r.pdf.Rectangle(x, top, x+base.w+pad*2, top+h, "D", 0, 0)
+			// m:borderBoxPr lets the author hide individual sides — used
+			// for "show only the top stroke" notation. We paint each side
+			// separately so the hide flags select which lines to draw.
+			if !hideTop {
+				r.pdf.Line(x, top, right, top)
+			}
+			if !hideBot {
+				r.pdf.Line(x, bot, right, bot)
+			}
+			if !hideLeft {
+				r.pdf.Line(x, top, x, bot)
+			}
+			if !hideRight {
+				r.pdf.Line(right, top, right, bot)
+			}
 		},
 	}
 }
@@ -993,6 +1058,20 @@ func (r *renderer) mathMatrixBox(n *docx.MathNode, fontSize float64) mathBox {
 	if totalH > 0 {
 		totalH -= rowGap
 	}
+	// Resolve per-column alignment ("l"/"c"/"r"); default center.
+	colJc := make([]string, cols)
+	for j := range colJc {
+		colJc[j] = "c"
+	}
+	for j, jc := range n.MatrixColJc {
+		if j >= cols {
+			break
+		}
+		switch jc {
+		case "l", "c", "r":
+			colJc[j] = jc
+		}
+	}
 	return mathBox{
 		w:       totalW + 4,
 		ascent:  totalH / 2,
@@ -1003,9 +1082,17 @@ func (r *renderer) mathMatrixBox(n *docx.MathNode, fontSize float64) mathBox {
 				cx := x + 2
 				for j := 0; j < cols; j++ {
 					if row[j].draw != nil {
-						// Center each cell in its column; baseline at row mid-line.
 						cellAsc := row[j].ascent
-						row[j].draw(r, cx+(colW[j]-row[j].w)/2, y+cellAsc)
+						var ox float64
+						switch colJc[j] {
+						case "l":
+							ox = 0
+						case "r":
+							ox = colW[j] - row[j].w
+						default:
+							ox = (colW[j] - row[j].w) / 2
+						}
+						row[j].draw(r, cx+ox, y+cellAsc)
 					}
 					cx += colW[j] + colGap
 				}

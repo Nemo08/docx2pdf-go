@@ -1,6 +1,7 @@
 package render
 
 import (
+	"image"
 	"testing"
 	"time"
 
@@ -187,5 +188,52 @@ func TestFirstNonEmpty(t *testing.T) {
 	}
 	if got := firstNonEmpty("", ""); got != "" {
 		t.Errorf("firstNonEmpty: got %q want empty", got)
+	}
+}
+
+func TestLookupFieldValue_INCLUDEPICTURE_RID(t *testing.T) {
+	img := newTestImage(2, 2)
+	v := fieldVars{
+		allImages:    map[string]image.Image{"rId7": img},
+		imageTargets: map[string]string{"rId7": "media/diagram.png"},
+		seqCounters:  map[string]int{},
+	}
+	// rId form: directly maps to an image we have.
+	got, ok := lookupFieldValueWith("INCLUDEPICTURE", `"rId7"`, v)
+	if !ok || got != "[image:rId7]" {
+		t.Errorf("rId lookup = (%q,%v), want ([image:rId7], true)", got, ok)
+	}
+	// Path/basename form: scans imageTargets for a basename match.
+	got, ok = lookupFieldValueWith("INCLUDEPICTURE", `"C:\\Users\\alice\\diagram.png"`, v)
+	if !ok || got != "[image:rId7]" {
+		t.Errorf("path lookup = (%q,%v), want ([image:rId7], true)", got, ok)
+	}
+	// Miss: empty (so caller keeps cached drawing).
+	got, ok = lookupFieldValueWith("INCLUDEPICTURE", `"nowhere.png"`, v)
+	if ok || got != "" {
+		t.Errorf("miss lookup = (%q,%v), want (\"\", false)", got, ok)
+	}
+}
+
+// newTestImage is the minimal stand-in image used by the INCLUDEPICTURE
+// test: a 2×2 NRGBA the field code's allImages registry can index by rId.
+func newTestImage(w, h int) image.Image {
+	return image.NewNRGBA(image.Rect(0, 0, w, h))
+}
+
+func TestLookupFieldValue_DISPLAYBARCODE(t *testing.T) {
+	v := fieldVars{seqCounters: map[string]int{}}
+	cases := []struct {
+		arg, want string
+	}{
+		{`"1234567890" CODE128`, "[CODE128: 1234567890]"},
+		{`"https://example.com" QR`, "[QR: https://example.com]"},
+		{`"product-x"`, "[barcode: product-x]"},
+	}
+	for _, c := range cases {
+		got, ok := lookupFieldValueWith("DISPLAYBARCODE", c.arg, v)
+		if !ok || got != c.want {
+			t.Errorf("DISPLAYBARCODE %q = (%q,%v), want (%q,true)", c.arg, got, ok, c.want)
+		}
 	}
 }
