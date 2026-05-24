@@ -28,3 +28,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+cover
+cover.*
+*cover*
+*.bat
+*.pdf
+*.docx
