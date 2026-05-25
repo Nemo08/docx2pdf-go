@@ -90,9 +90,9 @@ func TestCropImage(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name                 string
-		top, bottom, l, r    float64
-		wantW, wantH         int
+		name              string
+		top, bottom, l, r float64
+		wantW, wantH      int
 	}{
 		{"no_crop", 0, 0, 0, 0, 100, 100},
 		{"crop_even", 10, 10, 10, 10, 80, 80},

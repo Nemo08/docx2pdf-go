@@ -34,3 +34,13 @@ cover.*
 *.bat
 *.pdf
 *.docx
+docx2pdf.go
+example_test.go
+/internal/verify
+/tools/docx2txt
+/tools/pdfinfo
+tools/README.md
+/tools
+docx2pdf.go
+example_test.go
+/cmd/docx2pdf

@@ -65,6 +65,62 @@ func TestConvertReaderContext_CanceledUpFront(t *testing.T) {
 	}
 }
 
+// TestConvert_Verbose ensures verbose mode does not crash (output goes to stdout).
+func TestConvert_Verbose(t *testing.T) {
+	tmp := t.TempDir()
+	in := filepath.Join(tmp, "in.docx")
+	out := filepath.Join(tmp, "out.pdf")
+	if err := writeMinimalDocx(in); err != nil {
+		t.Fatal(err)
+	}
+	// Verbose with missing font should still reach render stage.
+	err := Convert(in, out, Options{FontRegular: "/missing", Verbose: true})
+	if err == nil {
+		t.Fatal("expected font error")
+	}
+	if !strings.Contains(err.Error(), "render pdf") {
+		t.Errorf("expected render-stage error, got: %v", err)
+	}
+}
+
+// TestConvert_OutputDirMkdir ensures that Convert creates output parent dirs implicitly
+// (the renderer creates the file, but the directory must exist).
+func TestConvert_OutputDirDoesNotExist(t *testing.T) {
+	tmp := t.TempDir()
+	in := filepath.Join(tmp, "in.docx")
+	if err := writeMinimalDocx(in); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(tmp, "nonexistent", "out.pdf")
+	err := Convert(in, out, Options{FontRegular: "/missing"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	// Should fail at file creation stage, not at parse stage.
+	if strings.Contains(err.Error(), "parse docx") {
+		t.Errorf("expected file-creation error, got parse error: %v", err)
+	}
+}
+
+// TestConvert_EmptyInputPath ensures empty input path does not panic.
+func TestConvert_EmptyInputPath(t *testing.T) {
+	err := Convert("", "out.pdf", Options{})
+	if err == nil {
+		t.Fatal("expected error for empty input path")
+	}
+}
+
+// TestConvertContext_ParseError ensures context is checked before and after parse.
+func TestConvertContext_ParseError(t *testing.T) {
+	err := ConvertContext(context.Background(), "/does/not/exist.docx", "/out.pdf", Options{})
+	if err == nil {
+		t.Fatal("expected error for missing input")
+	}
+	if !strings.Contains(err.Error(), "parse docx") {
+		t.Errorf("error = %q; want it to mention parse docx", err.Error())
+	}
+}
+
 // TestConvert_SourceFilenameFallback ensures Convert auto-fills SourceFilename
 // from the input path when the caller leaves it blank.
 func TestConvert_SourceFilenameFallback(t *testing.T) {

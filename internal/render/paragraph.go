@@ -76,6 +76,8 @@ func (r *renderer) drawParagraph(p docx.Paragraph) error {
 	if p.ContextualSpacing && p.StyleID != "" && p.StyleID == r.prevStyleID {
 		sb = 0
 	}
+	lineEstimate := r.opts.DefaultFontSize * 1.2
+	r.ensureRoom(sb + lineEstimate)
 	if sb > 0 {
 		r.cursorY += sb
 	}

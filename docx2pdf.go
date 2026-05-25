@@ -130,6 +130,16 @@ func RenderWriter(doc *Document, w io.Writer, opts Options) error {
 	return render.RenderWriter(doc, w, opts)
 }
 
+// OpenWithPassword parses a password-protected docx file at path.
+func OpenWithPassword(path, password string) (*Document, error) {
+	return docx.OpenWithPassword(path, password)
+}
+
+// ParseWithPassword is the streaming variant of OpenWithPassword.
+func ParseWithPassword(r io.ReaderAt, size int64, password string) (*Document, error) {
+	return docx.ParseWithPassword(r, size, password)
+}
+
 // ConvertContext is Convert with cancellation. The context is checked at
 // each section boundary, so cancellation interrupts within a few hundred
 // milliseconds even for long documents.

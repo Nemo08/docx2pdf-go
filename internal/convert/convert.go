@@ -20,36 +20,14 @@ type Options = render.Options
 // Convert reads a docx file from inPath and writes the rendered PDF to
 // outPath. The simplest entry point for users who already have file paths.
 func Convert(inPath, outPath string, opts Options) error {
-	if opts.SourceFilename == "" {
-		opts.SourceFilename = inPath
-	}
-	doc, err := docx.Open(inPath)
-	if err != nil {
-		return fmt.Errorf("parse docx: %w", err)
-	}
-	if opts.Verbose {
-		fmt.Printf("parsed: %d blocks, %d images, page %dx%d twips\n",
-			len(doc.Body), len(doc.Images),
-			doc.PageSize.WidthTwips, doc.PageSize.HeightTwips)
-	}
-	if err := render.Render(doc, outPath, opts); err != nil {
-		return fmt.Errorf("render pdf: %w", err)
-	}
-	return nil
+	return ConvertContext(context.Background(), inPath, outPath, opts)
 }
 
 // ConvertReader is the streaming variant. It parses the docx from an
 // io.ReaderAt (of the given size) and writes the PDF to w. Useful for
 // in-memory pipelines, HTTP handlers, or any non-file source/sink.
 func ConvertReader(r io.ReaderAt, size int64, w io.Writer, opts Options) error {
-	doc, err := docx.Parse(r, size)
-	if err != nil {
-		return fmt.Errorf("parse docx: %w", err)
-	}
-	if err := render.RenderWriter(doc, w, opts); err != nil {
-		return fmt.Errorf("render pdf: %w", err)
-	}
-	return nil
+	return ConvertReaderContext(context.Background(), r, size, w, opts)
 }
 
 // ConvertContext is Convert with cancellation. Returns ctx.Err() promptly
@@ -67,6 +45,11 @@ func ConvertContext(ctx context.Context, inPath, outPath string, opts Options) e
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if opts.Verbose {
+		fmt.Printf("parsed: %d blocks, %d images, page %dx%d twips\n",
+			len(doc.Body), len(doc.Images),
+			doc.PageSize.WidthTwips, doc.PageSize.HeightTwips)
 	}
 	if err := render.RenderWithContext(ctx, doc, outPath, opts); err != nil {
 		return fmt.Errorf("render pdf: %w", err)

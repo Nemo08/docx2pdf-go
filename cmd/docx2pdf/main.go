@@ -28,6 +28,8 @@ import (
 	"github.com/bobyeoh/docx2pdf-go/internal/convert"
 )
 
+type job struct{ src, rel, dst string }
+
 func main() {
 	in := flag.String("in", "", "input .docx path OR directory OR '-' for stdin (required)")
 	out := flag.String("out", "", "output .pdf path OR directory OR '-' for stdout (required)")
@@ -168,7 +170,6 @@ func runBatch(inDir, outDir string, recursive, keepGoing bool, workers int, opts
 		workers = runtime.NumCPU() * 2
 	}
 
-	type job struct{ src, rel, dst string }
 	jobs := make(chan job, len(files))
 	var failedMu sync.Mutex
 	failed := 0
@@ -178,21 +179,7 @@ func runBatch(inDir, outDir string, recursive, keepGoing bool, workers int, opts
 		defer wg.Done()
 		for j := range jobs {
 			start := time.Now()
-			if err := os.MkdirAll(filepath.Dir(j.dst), 0o755); err != nil {
-				fmt.Fprintf(os.Stderr, "error: %s: %v\n", j.src, err)
-				failedMu.Lock()
-				failed++
-				failedMu.Unlock()
-				if !keepGoing {
-					// Drain remaining and stop.
-					for range jobs {
-					}
-					return
-				}
-				continue
-			}
-			if err := convert.Convert(j.src, j.dst, opts); err != nil {
-				fmt.Fprintf(os.Stderr, "error: %s: %v\n", j.src, err)
+			if err := convertFile(j, keepGoing, opts); err != nil {
 				failedMu.Lock()
 				failed++
 				failedMu.Unlock()
@@ -258,4 +245,17 @@ func findDocx(root string, recursive bool) ([]string, error) {
 
 func withExt(p, newExt string) string {
 	return strings.TrimSuffix(p, filepath.Ext(p)) + newExt
+}
+
+// convertFile converts a single docx file and reports failures to stderr.
+func convertFile(j job, keepGoing bool, opts convert.Options) error {
+	if err := os.MkdirAll(filepath.Dir(j.dst), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s: %v\n", j.src, err)
+		return err
+	}
+	if err := convert.Convert(j.src, j.dst, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s: %v\n", j.src, err)
+		return err
+	}
+	return nil
 }

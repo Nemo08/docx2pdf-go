@@ -26,8 +26,8 @@ func TestHasSeriesNames(t *testing.T) {
 
 func TestSeriesValueRange(t *testing.T) {
 	tests := []struct {
-		name         string
-		series       []docx.ChartSeries
+		name             string
+		series           []docx.ChartSeries
 		wantMin, wantMax float64
 	}{
 		{"empty", nil, 0, 1},
@@ -50,9 +50,9 @@ func TestSeriesValueRange(t *testing.T) {
 
 func TestStackedValueRange(t *testing.T) {
 	tests := []struct {
-		name    string
-		series  []docx.ChartSeries
-		percent bool
+		name             string
+		series           []docx.ChartSeries
+		percent          bool
 		wantMin, wantMax float64
 	}{
 		{"percent", nil, true, 0, 100},
@@ -258,10 +258,10 @@ func TestUtf8len(t *testing.T) {
 
 func TestApplyColorMods(t *testing.T) {
 	tests := []struct {
-		name                 string
-		hex                  string
+		name                           string
+		hex                            string
 		lumMod, lumOff, satMod, satOff float64
-		want                 string
+		want                           string
 	}{
 		{"no_mods", "FF0000", 0, 0, 0, 0, "FF0000"},
 		{"lum_mod", "FF0000", 0.5, 0, 0, 0, "800000"},

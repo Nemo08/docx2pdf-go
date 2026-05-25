@@ -33,8 +33,6 @@ func TestIsRTL(t *testing.T) {
 	}
 }
 
-
-
 func TestIsSymbolGlyph(t *testing.T) {
 	tests := []struct {
 		r    rune
@@ -64,8 +62,8 @@ func TestIsPUA(t *testing.T) {
 		want bool
 	}{
 		{'A', false},
-		{'\uE000', true},  // BMP PUA start
-		{'\uF8FF', true},  // BMP PUA end
+		{'\uE000', true},     // BMP PUA start
+		{'\uF8FF', true},     // BMP PUA end
 		{'\U000F0000', true}, // Suppl PUA-A start
 		{'\U0010FFFD', true}, // Suppl PUA-B end
 	}
@@ -114,14 +112,12 @@ func TestCharSpacingFor(t *testing.T) {
 	}
 }
 
-
-
 func TestRGBToHSL(t *testing.T) {
 	type hsv struct{ h, s, l float64 }
 	tests := []struct {
-		name   string
+		name    string
 		r, g, b uint8
-		want   hsv
+		want    hsv
 	}{
 		{"black", 0, 0, 0, hsv{0, 0, 0}},
 		{"white", 255, 255, 255, hsv{0, 0, 1}},
@@ -149,9 +145,9 @@ func TestRGBToHSL(t *testing.T) {
 func TestHSLToRGB(t *testing.T) {
 	type rgb struct{ r, g, b uint8 }
 	tests := []struct {
-		name     string
-		h, s, l  float64
-		want     rgb
+		name    string
+		h, s, l float64
+		want    rgb
 	}{
 		{"black", 0, 0, 0, rgb{0, 0, 0}},
 		{"white", 0, 0, 1, rgb{255, 255, 255}},
@@ -167,7 +163,3 @@ func TestHSLToRGB(t *testing.T) {
 		}
 	}
 }
-
-
-
-

@@ -449,7 +449,11 @@ func (r *renderer) applyLineHeight(natural float64) float64 {
 	}
 	// docGrid snap: only for the line-grid modes ("lines" or
 	// "linesAndChars"). The pitch is in 1/20 pt units.
-	if (r.activeDocGrid.Type == "lines" || r.activeDocGrid.Type == "linesAndChars") &&
+	gridType := r.activeDocGrid.Type
+	if gridType == "" && r.activeDocGrid.LinePitch > 0 {
+		gridType = "lines"
+	}
+	if (gridType == "lines" || gridType == "linesAndChars") &&
 		r.activeDocGrid.LinePitch > 0 && r.lineHeight.Rule != "exact" {
 		pitch := float64(r.activeDocGrid.LinePitch) / 20.0
 		if pitch > 0 {

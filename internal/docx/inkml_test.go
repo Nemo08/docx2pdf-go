@@ -48,9 +48,9 @@ func TestParseInkTrace(t *testing.T) {
 
 func TestInkStrokeBounds(t *testing.T) {
 	tests := []struct {
-		name            string
-		strokes         []InkStroke
-		wantOk          bool
+		name               string
+		strokes            []InkStroke
+		wantOk             bool
 		wantMinX, wantMaxX float64
 	}{
 		{"empty", nil, false, 0, 0},
